@@ -1,0 +1,21 @@
+{
+  "name": "review-outpost",
+  "version": "4.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ephemeral AI image review outpost on Cloudflare Workers, R2, D1, and Access",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run tests/worker"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261110.1",
+    "@types/node": "^22.13.9",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8",
+    "wrangler": "^4.0.0"
+  }
+}

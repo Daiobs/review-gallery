@@ -1,0 +1,12 @@
+# Local development environment variables (copy to .dev.vars; never commit .dev.vars)
+ENVIRONMENT="development"
+DEV_BYPASS_ACCESS="false"
+
+# Cloudflare Zero Trust (Access) configuration
+CF_ACCESS_TEAM_DOMAIN="<YOUR_TEAM>.cloudflareaccess.com"
+CF_ACCESS_AUD="<CF_ACCESS_APPLICATION_AUD_TAG>"
+CF_ACCESS_ALLOWED_EMAILS="<YOUR_EMAIL>"
+
+# Agent authentication tokens (JSON object mapping agent_id -> random 32-byte hex token)
+# Generate independent tokens with: openssl rand -hex 32
+AGENT_TOKENS_JSON='{"muse-main":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>","argon-mac":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>"}'
