@@ -2,6 +2,10 @@
 
 审图哨所 v4 是一个面向高频 AI 生图工作流的**阅后即焚云端审图中转站**。各端 Agent（如跑在仅出站云端 VM 上的 `muse-main`、本地 Mac 上的 `argon-mac`）将原分辨率压缩预览图推送至在线审图台，审图人在电脑或手机浏览器上通过快捷键/触屏批量定档打标；Agent 拉回结论并在本地完成 Google Drive 原图归档后，通知云端整批物理清空预览图与数据库记录。
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Daiobs/review-gallery)
+
+> **一键部署说明**：点击上方按钮会将本仓库克隆到你的 GitHub 账号（建议设为 Private 私有仓库）、按 `wrangler.toml` 自动创建私有 R2 桶与 D1 数据库并回填 ID、通过 `deploy` 脚本自动执行 D1 建表迁移，并按 `.dev.vars.example` 引导填写 4 项线上 Secret。按钮跑通后仍须手动完成三步安全闭环：①在 Cloudflare 后台 `Worker -> Settings -> Domains & Routes` 添加你的自定义域名（本项目已禁用 `workers.dev` 预览入口）；②按本文第 4 节在 Zero Trust 后台配置两个 Access 应用（建好应用 A 后获取 AUD 填入 `CF_ACCESS_AUD`）；③用 `openssl rand -hex 32` 生成各 Agent 独立令牌填入 `AGENT_TOKENS_JSON`。
+
 ---
 
 ## 1. 项目概览与架构安全原则
@@ -485,14 +489,16 @@ python3 agent/hub_client.py push \
    ```bash
    cp .dev.vars.example .dev.vars
    ```
-2. 编辑 `.dev.vars`（模板默认 `DEV_BYPASS_ACCESS="false"`；如需在本地浏览器免 Access JWT 联调页面，可显式改为 `"true"`，以下全部为占位符）：
+2. 编辑 `.dev.vars`（模板默认注释了本地覆写开关；如需在本地浏览器免 Access JWT 联调页面，取消底部 `ENVIRONMENT=development` 与 `DEV_BYPASS_ACCESS=true` 两行注释即可，以下全部为占位符）：
    ```ini
-   ENVIRONMENT="development"
-   DEV_BYPASS_ACCESS="true"
-   CF_ACCESS_TEAM_DOMAIN="<YOUR_TEAM>.cloudflareaccess.com"
-   CF_ACCESS_AUD="<CF_ACCESS_APPLICATION_AUD_TAG>"
-   CF_ACCESS_ALLOWED_EMAILS="<YOUR_EMAIL>"
-   AGENT_TOKENS_JSON='{"muse-main":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>","argon-mac":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>"}'
+   CF_ACCESS_TEAM_DOMAIN=<YOUR_TEAM>.cloudflareaccess.com
+   CF_ACCESS_AUD=<CF_ACCESS_APPLICATION_AUD_TAG>
+   CF_ACCESS_ALLOWED_EMAILS=<YOUR_EMAIL>
+   AGENT_TOKENS_JSON={"muse-main":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>","argon-mac":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>"}
+
+   # Local-only overrides (uncomment ONLY in local .dev.vars when testing without Access JWT):
+   ENVIRONMENT=development
+   DEV_BYPASS_ACCESS=true
    ```
    > [!NOTE]
    > **本地开发免 Access 开关安全约束**：Worker 仅在 `ENVIRONMENT === "development"` **且** `DEV_BYPASS_ACCESS === "true"` **两个条件同时满足**时，才允许本地浏览器在不携带 `Cf-Access-Jwt-Assertion` 的情况下访问页面与 `/api/review/*` 接口。`wrangler.toml` 生产 `[vars]` 固定为 `ENVIRONMENT = "production"` 与 `DEV_BYPASS_ACCESS = "false"`，线上环境切勿开启 `DEV_BYPASS_ACCESS`。
