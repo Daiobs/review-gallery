@@ -30,6 +30,8 @@
         <div id="batch-header-meta" class="batch-header-meta" hidden>
           <div class="batch-title-row">
             <h1 id="header-batch-id" class="header-batch-id"></h1>
+            <span id="header-channel-badge" class="pill pill-channel"></span>
+            <span id="header-type-badge" class="pill pill-type"></span>
             <span id="header-agent-badge" class="pill pill-agent"></span>
             <span id="header-status-badge" class="pill"></span>
           </div>
@@ -39,7 +41,7 @@
               <div id="header-progress-fill" class="header-progress-fill"></div>
             </div>
             <span class="stat-sep" aria-hidden="true">|</span>
-            <span id="header-bucket-summary" class="stat-bucket-summary">归档 0 · 修复 0 · 重抽 0 · 淘汰 0</span>
+            <span id="header-bucket-summary" class="stat-bucket-summary">拟归档 0 · 待修复 0 · 待重抽 0 · 不收录 0</span>
           </div>
         </div>
       </div>
@@ -84,10 +86,13 @@
         <div class="section-intro">
           <div>
             <h2 class="section-heading">待审与待归档批次</h2>
-            <p class="section-sub">云端阅后即焚中转站 · 定档完成后由本地 Agent 拉取结论并归档原图</p>
+            <p class="section-sub">云端阅后即焚中转站 · 定档完成后由本地 Agent 拉取结论并执行归档后确认销毁</p>
           </div>
           <div id="batch-list-count" class="batch-list-count"></div>
         </div>
+
+        <!-- Dynamic Source × Line Channel Bar (Section 5.1) -->
+        <div id="channel-bar" class="channel-bar" role="tablist" aria-label="生图通道筛选" hidden></div>
 
         <div id="batch-list-loading" class="state-box" hidden>
           <div class="spinner" aria-hidden="true"></div>
@@ -96,7 +101,7 @@
 
         <div id="batch-list-empty" class="state-box" hidden>
           <p class="state-title">当前暂无云端待审批次</p>
-          <p class="state-desc">使用 <code>hub_client.py push</code> 推送预览图后将在此处显示；已 ack 确认的批次已被自动物理清除。</p>
+          <p class="state-desc">使用 <code>hub_client.py push</code> 推送预览图后将在此处自动按通道显示；已 ack 确认的批次已被自动物理清除。</p>
         </div>
 
         <div id="batch-list-grid" class="batch-cards-grid"></div>
@@ -110,7 +115,7 @@
             <span class="locked-icon" aria-hidden="true">🔒</span>
             <div>
               <strong>已标记审完，等待 Agent 拉取归档</strong>
-              <span class="locked-sub">当前批次处于只读锁定态，未定档且无修复/重抽标记的图片将按「不收录」处理。若 Agent 尚未执行 ack，可撤回继续修改。</span>
+              <span class="locked-sub">当前批次处于只读锁定态，未定档且无修复标记的图片将按「不收录」处理（独立 R 标记仍生成重抽待办）。若 Agent 尚未执行 ack，可撤回继续修改。</span>
             </div>
           </div>
           <button id="btn-banner-revoke" class="btn btn-warning btn-sm" type="button">
@@ -123,22 +128,23 @@
           <span>⚠️ 本批次已超过 7 天未 ack，R2 预览图已按策略清理，仅保留 D1 审图结论记录。</span>
         </div>
 
-        <!-- Filter & Shortcut Hint Strip -->
+        <!-- Filter & Shortcut Hint Strip (Section 5.3) -->
         <div class="subbar">
-          <div id="bucket-filter-bar" class="filter-pills" role="tablist" aria-label="按归桶筛选">
+          <div id="bucket-filter-bar" class="filter-pills" role="tablist" aria-label="按结论与旁路筛选">
             <button class="filter-pill active" type="button" data-filter="all">全部 <span id="flt-count-all" class="flt-num">0</span></button>
             <button class="filter-pill" type="button" data-filter="unjudged">未判 <span id="flt-count-unjudged" class="flt-num">0</span></button>
-            <button class="filter-pill" type="button" data-filter="archived">拟归档 <span id="flt-count-archived" class="flt-num">0</span></button>
+            <button class="filter-pill" type="button" data-filter="archive">拟归档 <span id="flt-count-archive" class="flt-num">0</span></button>
             <button class="filter-pill" type="button" data-filter="repair">待修复 <span id="flt-count-repair" class="flt-num">0</span></button>
             <button class="filter-pill" type="button" data-filter="redraw">待重抽 <span id="flt-count-redraw" class="flt-num">0</span></button>
-            <button class="filter-pill" type="button" data-filter="discarded">不收录 <span id="flt-count-discarded" class="flt-num">0</span></button>
+            <button class="filter-pill" type="button" data-filter="discard">不收录 <span id="flt-count-discard" class="flt-num">0</span></button>
           </div>
 
-          <div class="shortcut-strip hide-mobile" aria-hidden="true">
+          <div id="shortcut-strip" class="shortcut-strip hide-mobile" aria-hidden="true">
             <span><kbd>←</kbd><kbd>→</kbd> 选图</span>
-            <span><kbd>1</kbd> 神图</span>
-            <span><kbd>2</kbd> 心动</span>
-            <span><kbd>3</kbd> 高品质</span>
+            <span><kbd>1</kbd> <em data-vocab-tier="3">★★★ 神图</em></span>
+            <span><kbd>2</kbd> <em data-vocab-tier="2">★★ 心动</em></span>
+            <span><kbd>3</kbd> <em data-vocab-tier="1">★ 高品质</em></span>
+            <span><kbd>4</kbd> <em data-vocab-tier="0">☆ 收藏</em></span>
             <span><kbd>H</kbd> 手</span>
             <span><kbd>F</kbd> 脚</span>
             <span><kbd>O</kbd> 局部</span>
@@ -169,7 +175,7 @@
         <div class="dock-sel-info">
           <span id="dock-index-label" class="dock-index-label">0 / 0</span>
           <span id="dock-item-label" class="dock-item-label">未选择图片</span>
-          <span id="dock-bucket-badge" class="bucket-badge bucket-discarded">不收录</span>
+          <span id="dock-bucket-badge" class="bucket-badge disp-discard">不收录</span>
         </div>
         <div class="dock-nav-group">
           <button id="dock-prev" class="dock-nav-btn" type="button" title="上一张 (←)" aria-label="上一张">‹</button>
@@ -178,33 +184,53 @@
         </div>
       </div>
 
-      <div class="dock-buttons-row">
-        <button class="dock-btn dock-tier-1" type="button" data-action-tier="1" title="1 档：神图（再按取消）">
-          <span class="dock-key">1</span><span class="dock-txt">神图</span>
-        </button>
-        <button class="dock-btn dock-tier-2" type="button" data-action-tier="2" title="2 档：心动（再按取消）">
-          <span class="dock-key">2</span><span class="dock-txt">心动</span>
-        </button>
-        <button class="dock-btn dock-tier-3" type="button" data-action-tier="3" title="3 档：高品质（再按取消）">
-          <span class="dock-key">3</span><span class="dock-txt">高品质</span>
-        </button>
-        <span class="dock-divider" aria-hidden="true"></span>
-        <button class="dock-btn dock-flag" type="button" data-action-flag="H" title="H：修手指（可叠加）">
-          <span class="dock-key">H</span><span class="dock-txt">修手</span>
-        </button>
-        <button class="dock-btn dock-flag" type="button" data-action-flag="F" title="F：修脚（可叠加）">
-          <span class="dock-key">F</span><span class="dock-txt">修脚</span>
-        </button>
-        <button class="dock-btn dock-flag" type="button" data-action-flag="O" title="O：其他局部修复（可叠加）">
-          <span class="dock-key">O</span><span class="dock-txt">局部</span>
-        </button>
-        <button class="dock-btn dock-flag dock-flag-r" type="button" data-action-flag="R" title="R：同提示词重抽">
-          <span class="dock-key">R</span><span class="dock-txt">重抽</span>
-        </button>
-        <button id="dock-note-btn" class="dock-btn dock-note" type="button" data-action-note="true" title="N：编写备注">
-          <span class="dock-key">N</span><span class="dock-txt">备注</span>
-          <span id="dock-note-dot" class="note-dot" hidden></span>
-        </button>
+      <div class="dock-controls-wrap">
+        <div class="dock-tiers-row">
+          <button class="dock-btn dock-tier-btn dock-tier-3" type="button" data-action-tier="3" title="快捷键 1：三星档（再按取消）">
+            <span class="key-corner">1</span>
+            <span class="dock-stars">★★★</span>
+            <span class="dock-txt" data-tier-name="3">神图</span>
+          </button>
+          <button class="dock-btn dock-tier-btn dock-tier-2" type="button" data-action-tier="2" title="快捷键 2：二星档（再按取消）">
+            <span class="key-corner">2</span>
+            <span class="dock-stars">★★</span>
+            <span class="dock-txt" data-tier-name="2">心动</span>
+          </button>
+          <button class="dock-btn dock-tier-btn dock-tier-1" type="button" data-action-tier="1" title="快捷键 3：一星档（再按取消）">
+            <span class="key-corner">3</span>
+            <span class="dock-stars">★</span>
+            <span class="dock-txt" data-tier-name="1">高品质</span>
+          </button>
+          <button class="dock-btn dock-tier-btn dock-tier-0" type="button" data-action-tier="0" title="快捷键 4：零星收藏/留样档（再按取消）">
+            <span class="key-corner">4</span>
+            <span class="dock-stars">☆</span>
+            <span class="dock-txt" data-tier-name="0">收藏</span>
+          </button>
+        </div>
+
+        <div class="dock-flags-row">
+          <button class="dock-btn dock-flag" type="button" data-action-flag="H" title="快捷键 H：修手指（转为待修复并保留意向档）">
+            <span class="key-corner">H</span>
+            <span class="dock-txt">修手</span>
+          </button>
+          <button class="dock-btn dock-flag" type="button" data-action-flag="F" title="快捷键 F：修脚（转为待修复并保留意向档）">
+            <span class="key-corner">F</span>
+            <span class="dock-txt">修脚</span>
+          </button>
+          <button class="dock-btn dock-flag" type="button" data-action-flag="O" title="快捷键 O：其他局部修复（转为待修复并保留意向档）">
+            <span class="key-corner">O</span>
+            <span class="dock-txt">局部</span>
+          </button>
+          <button class="dock-btn dock-flag dock-flag-r" type="button" data-action-flag="R" title="快捷键 R：独立旁路重抽（与主去向正交叠加）">
+            <span class="key-corner">R</span>
+            <span class="dock-txt">重抽</span>
+          </button>
+          <button id="dock-note-btn" class="dock-btn dock-note" type="button" data-action-note="true" title="快捷键 N：编写备注">
+            <span class="key-corner">N</span>
+            <span class="dock-txt">备注</span>
+            <span id="dock-note-dot" class="note-dot" hidden></span>
+          </button>
+        </div>
       </div>
     </nav>
 
@@ -214,9 +240,10 @@
         <div class="lb-meta">
           <span id="lb-counter" class="lb-counter">1 / 1</span>
           <span id="lb-round-badge" class="badge badge-round" hidden>R2</span>
+          <span id="lb-lineage-badge" class="badge badge-lineage" hidden></span>
           <span id="lb-item-id" class="lb-item-id"></span>
           <span id="lb-dimensions" class="lb-dimensions"></span>
-          <span id="lb-bucket-badge" class="bucket-badge bucket-discarded">不收录</span>
+          <span id="lb-bucket-badge" class="bucket-badge disp-discard">不收录</span>
         </div>
 
         <div class="lb-zoom-controls">
@@ -248,33 +275,53 @@
 
       <!-- Lightbox Verdict Controls (Touch & Mouse friendly >=44px) -->
       <footer class="lightbox-footer">
-        <div class="dock-buttons-row lb-dock-row">
-          <button class="dock-btn dock-tier-1" type="button" data-action-tier="1">
-            <span class="dock-key">1</span><span class="dock-txt">神图</span>
-          </button>
-          <button class="dock-btn dock-tier-2" type="button" data-action-tier="2">
-            <span class="dock-key">2</span><span class="dock-txt">心动</span>
-          </button>
-          <button class="dock-btn dock-tier-3" type="button" data-action-tier="3">
-            <span class="dock-key">3</span><span class="dock-txt">高品质</span>
-          </button>
-          <span class="dock-divider" aria-hidden="true"></span>
-          <button class="dock-btn dock-flag" type="button" data-action-flag="H">
-            <span class="dock-key">H</span><span class="dock-txt">修手</span>
-          </button>
-          <button class="dock-btn dock-flag" type="button" data-action-flag="F">
-            <span class="dock-key">F</span><span class="dock-txt">修脚</span>
-          </button>
-          <button class="dock-btn dock-flag" type="button" data-action-flag="O">
-            <span class="dock-key">O</span><span class="dock-txt">局部</span>
-          </button>
-          <button class="dock-btn dock-flag dock-flag-r" type="button" data-action-flag="R">
-            <span class="dock-key">R</span><span class="dock-txt">重抽</span>
-          </button>
-          <button id="lb-note-btn" class="dock-btn dock-note" type="button" data-action-note="true">
-            <span class="dock-key">N</span><span class="dock-txt">备注</span>
-            <span id="lb-note-dot" class="note-dot" hidden></span>
-          </button>
+        <div class="dock-controls-wrap lb-controls-wrap">
+          <div class="dock-tiers-row">
+            <button class="dock-btn dock-tier-btn dock-tier-3" type="button" data-action-tier="3" title="快捷键 1：三星档（再按取消）">
+              <span class="key-corner">1</span>
+              <span class="dock-stars">★★★</span>
+              <span class="dock-txt" data-tier-name="3">神图</span>
+            </button>
+            <button class="dock-btn dock-tier-btn dock-tier-2" type="button" data-action-tier="2" title="快捷键 2：二星档（再按取消）">
+              <span class="key-corner">2</span>
+              <span class="dock-stars">★★</span>
+              <span class="dock-txt" data-tier-name="2">心动</span>
+            </button>
+            <button class="dock-btn dock-tier-btn dock-tier-1" type="button" data-action-tier="1" title="快捷键 3：一星档（再按取消）">
+              <span class="key-corner">3</span>
+              <span class="dock-stars">★</span>
+              <span class="dock-txt" data-tier-name="1">高品质</span>
+            </button>
+            <button class="dock-btn dock-tier-btn dock-tier-0" type="button" data-action-tier="0" title="快捷键 4：零星收藏/留样档（再按取消）">
+              <span class="key-corner">4</span>
+              <span class="dock-stars">☆</span>
+              <span class="dock-txt" data-tier-name="0">收藏</span>
+            </button>
+          </div>
+
+          <div class="dock-flags-row">
+            <button class="dock-btn dock-flag" type="button" data-action-flag="H" title="快捷键 H：修手指">
+              <span class="key-corner">H</span>
+              <span class="dock-txt">修手</span>
+            </button>
+            <button class="dock-btn dock-flag" type="button" data-action-flag="F" title="快捷键 F：修脚">
+              <span class="key-corner">F</span>
+              <span class="dock-txt">修脚</span>
+            </button>
+            <button class="dock-btn dock-flag" type="button" data-action-flag="O" title="快捷键 O：其他局部修复">
+              <span class="key-corner">O</span>
+              <span class="dock-txt">局部</span>
+            </button>
+            <button class="dock-btn dock-flag dock-flag-r" type="button" data-action-flag="R" title="快捷键 R：独立旁路重抽">
+              <span class="key-corner">R</span>
+              <span class="dock-txt">重抽</span>
+            </button>
+            <button id="lb-note-btn" class="dock-btn dock-note" type="button" data-action-note="true" title="快捷键 N：编写备注">
+              <span class="key-corner">N</span>
+              <span class="dock-txt">备注</span>
+              <span id="lb-note-dot" class="note-dot" hidden></span>
+            </button>
+          </div>
         </div>
       </footer>
     </div>
@@ -320,29 +367,31 @@
     <div id="help-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="help-modal-title" hidden>
       <div class="modal-panel modal-panel-wide">
         <div class="modal-header">
-          <h3 id="help-modal-title" class="modal-title">快捷键与归桶规则说明</h3>
+          <h3 id="help-modal-title" class="modal-title">四档星级快捷键与正交分流规则</h3>
           <button id="help-modal-close" class="btn btn-ghost btn-xs" type="button" aria-label="关闭">✕</button>
         </div>
         <div class="modal-body help-body">
           <div class="help-grid">
-            <div class="help-item"><kbd>1</kbd> <span>设为 <strong>神图</strong>（再按取消）</span></div>
-            <div class="help-item"><kbd>2</kbd> <span>设为 <strong>心动</strong>（再按取消）</span></div>
-            <div class="help-item"><kbd>3</kbd> <span>设为 <strong>高品质</strong>（再按取消）</span></div>
-            <div class="help-item"><kbd>H</kbd> <span>叠加/取消 <strong>修手指</strong></span></div>
-            <div class="help-item"><kbd>F</kbd> <span>叠加/取消 <strong>修脚</strong></span></div>
-            <div class="help-item"><kbd>O</kbd> <span>叠加/取消 <strong>其他局部修复</strong></span></div>
-            <div class="help-item"><kbd>R</kbd> <span>叠加/取消 <strong>同提示词重抽</strong></span></div>
+            <div class="help-item"><kbd>1</kbd> <span><strong>★★★ 神图 / 核心锚</strong>（<code>tier=3</code>，再按取消）</span></div>
+            <div class="help-item"><kbd>2</kbd> <span><strong>★★ 心动 / 优质锚</strong>（<code>tier=2</code>，再按取消）</span></div>
+            <div class="help-item"><kbd>3</kbd> <span><strong>★ 高品质 / 达标锚</strong>（<code>tier=1</code>，再按取消）</span></div>
+            <div class="help-item"><kbd>4</kbd> <span><strong>☆ 收藏 / 留样</strong>（<code>tier=0</code>，再按取消）</span></div>
+            <div class="help-item"><kbd>H</kbd> <span>叠加/取消 <strong>修手指</strong>（转为待修复）</span></div>
+            <div class="help-item"><kbd>F</kbd> <span>叠加/取消 <strong>修脚</strong>（转为待修复）</span></div>
+            <div class="help-item"><kbd>O</kbd> <span>叠加/取消 <strong>其他局部修复</strong>（转为待修复）</span></div>
+            <div class="help-item"><kbd>R</kbd> <span>叠加/取消 <strong>旁路重抽</strong>（不改变原图主去向）</span></div>
             <div class="help-item"><kbd>N</kbd> <span>打开 <strong>文本/语音备注</strong></span></div>
             <div class="help-item"><kbd>←</kbd> <kbd>→</kbd> <span>切换上一张 / 下一张</span></div>
             <div class="help-item"><kbd>Enter</kbd> / 双击 <span>打开原分辨率缩放灯箱</span></div>
+            <div class="help-item"><kbd>0</kbd>（灯箱内） <span>重置为 <strong>适应屏幕</strong> 缩放</span></div>
           </div>
           <div class="help-rule-box">
-            <strong>单图唯一归桶互斥优先级（Rule 3）：</strong>
+            <strong>单图结论正交规则（主去向 <code>destination</code> × 旁路重抽 <code>redraw</code>）：</strong>
             <ol>
-              <li>含 <code>H / F / O</code> 任一修复标记 → <strong>待修复 (repair)</strong>（同时完整保留已选档位供复审参考，如「待修复 (原定1档)」）</li>
-              <li>否则含 <code>R</code> 标记 → <strong>待重抽 (redraw)</strong></li>
-              <li>否则档位为 <code>1 / 2 / 3</code> → <strong>拟归档 (archived)</strong></li>
-              <li>其余（未定档且无标记） → <strong>不收录 (discarded)</strong></li>
+              <li>含 <code>H / F / O</code> 任一修复标记 → 主去向 <strong>待修复 (repair)</strong>（同时完整保留已打星级作为意向档，如「<code>待修复(意向★★★) · H</code>」）</li>
+              <li>否则已打星级（<code>tier ∈ {3, 2, 1, 0}</code>） → 主去向 <strong>拟归档 (archive)</strong></li>
+              <li>其余（未打星级且无修复标记） → 主去向 <strong>不收录 (discard)</strong></li>
+              <li><strong>独立旁路 <code>R</code>（重抽）</strong>：与上述三类主去向完全正交叠加——<code>★★★ + R</code> 既进「拟归档」又进「待重抽」；<code>仅 R</code> 原图不收录并生成重抽待办（「<code>仅重抽（原图不收）</code>」）。</li>
             </ol>
           </div>
         </div>

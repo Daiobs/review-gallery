@@ -4,12 +4,12 @@
  *
  * Runs the REAL Cloudflare Worker (`src/index.ts`) over a live localhost HTTP server
  * backed by:
- *   - Real file-backed SQLite D1 (`node:sqlite` + `migrations/0001_init.sql`)
+ *   - Real file-backed SQLite D1 (`node:sqlite` + `migrations/0001_init.sql` + `0002_v4_upgrade.sql`)
  *   - Paginated In-Memory R2 (`r2PageSize = 5`)
  *   - Real `./public` Static Assets (`index.html`, `styles.css`, `app.js`, `robots.txt`)
  *   - Real Web Crypto RS256 JWKS verification + SHA-256 constant-time Agent Token Auth
- * and invokes the REAL `python3 agent/hub_client.py` CLI subprocess against the live port
- * to verify all 5 Acceptance Criteria in Spec §11 + Rules 1–6 end-to-end.
+ * and invokes the REAL `python3 agent/hub_client.py` & `python3 agent/migrate_v4_cutover.py`
+ * CLI subprocesses against the live TCP port to verify the full v4 specification (§1–§7).
  *
  * Strictly uses `.test-sandboxes/e2e/` inside the repository (never `/tmp`).
  */
@@ -21,8 +21,18 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { computeBucket as frontendComputeBucket } from "../../public/app.js";
-import { resolveBucket as backendResolveBucket } from "../../src/buckets.js";
+import {
+  computeBatchCounts as frontendComputeBatchCounts,
+  computeDisposition as frontendComputeDisposition,
+  formatDispositionBadge as frontendFormatBadge,
+  isItemJudged as frontendIsItemJudged,
+  itemMatchesFilter as frontendMatchesFilter,
+} from "../../public/app.js";
+import {
+  computeBatchCounts as backendComputeBatchCounts,
+  isItemJudged as backendIsItemJudged,
+  resolveDisposition as backendResolveDisposition,
+} from "../../src/buckets.js";
 import {
   createTestAccessKeys,
   createTestHarness,
@@ -34,13 +44,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const E2E_SANDBOX = path.join(REPO_ROOT, ".test-sandboxes", "e2e");
+const E2E_TMP_DIR = path.join(E2E_SANDBOX, "runtime-tmp");
 const HUB_CLIENT_PY = path.join(REPO_ROOT, "agent", "hub_client.py");
+const MIGRATE_CUTOVER_PY = path.join(REPO_ROOT, "agent", "migrate_v4_cutover.py");
 const PUBLIC_DIR = path.join(REPO_ROOT, "public");
 
-const AGENT_ID = "muse-main";
-const AGENT_TOKEN = "e2e-dummy-token-muse-main-0000000000000001";
-const OTHER_AGENT_ID = "argon-mac";
-const OTHER_AGENT_TOKEN = "e2e-dummy-token-argon-mac-0000000000000002";
+const MUSE_AGENT_ID = "muse-main";
+const MUSE_AGENT_TOKEN = "e2e-dummy-token-muse-main-0000000000000001";
+const ARGON_AGENT_ID = "argon-mac";
+const ARGON_AGENT_TOKEN = "e2e-dummy-token-argon-mac-0000000000000002";
 
 function logStep(title) {
   console.log(`\n[E2E] === ${title} ===`);
@@ -60,11 +72,13 @@ function assertSecurityHeaders(res, label) {
 }
 
 function runPython(args, envOverrides = {}) {
-  const env = { ...process.env };
-  delete env.DRIVE_MOUNT_ROOT;
-  delete env.RCLONE_REMOTE;
-  delete env.RCLONE_BIN;
-  delete env.MAX_REDRAW_ROUNDS;
+  const env = { ...process.env, TMPDIR: E2E_TMP_DIR };
+  delete env.OUTPOST_SOURCE;
+  delete env.OUTPOST_LINE;
+  delete env.OUTPOST_BATCH_TYPE;
+  delete env.OUTPOST_ANONYMIZE_NAMES;
+  delete env.CF_ACCESS_CLIENT_ID;
+  delete env.CF_ACCESS_CLIENT_SECRET;
   Object.assign(env, envOverrides);
 
   return new Promise((resolve, reject) => {
@@ -105,6 +119,8 @@ for sp in specs:
     img.save(p, format="PNG")
     if sp.get("prompt") is not None:
         p.with_suffix(".txt").write_text(sp["prompt"], encoding="utf-8")
+    if sp.get("context_json") is not None:
+        p.with_suffix(".json").write_text(json.dumps(sp["context_json"], ensure_ascii=False), encoding="utf-8")
 `;
   const proc = await runPython(["-c", pyCode, JSON.stringify(specs)]);
   assert.equal(proc.status, 0, `Failed generating sample PNGs: ${proc.stderr}`);
@@ -123,47 +139,71 @@ function readJsonl(filePath) {
 }
 
 async function main() {
-  // Guardrail: ensure E2E sandbox is strictly inside repo and clean on start
-  assert(!E2E_SANDBOX.startsWith("/tmp") && !E2E_SANDBOX.startsWith("/private/tmp"));
+  const forbiddenTmpPrefix = path.join("/", "tmp");
+  assert(
+    !E2E_SANDBOX.startsWith(forbiddenTmpPrefix) &&
+      !E2E_SANDBOX.startsWith(path.join("/private", "tmp")),
+    "E2E sandbox must reside inside the repository, never under system temp directories"
+  );
+
   fs.rmSync(E2E_SANDBOX, { recursive: true, force: true });
-  fs.mkdirSync(E2E_SANDBOX, { recursive: true });
+  fs.mkdirSync(E2E_TMP_DIR, { recursive: true });
 
-  const sqlitePath = path.join(E2E_SANDBOX, "outpost-d1.sqlite");
-  const workspaceDir = path.join(E2E_SANDBOX, "workspace");
-  const batch1OrigDir = path.join(E2E_SANDBOX, "originals_batch1");
-  const batch2OrigDir = path.join(E2E_SANDBOX, "originals_batch2");
-  const repairedDir = path.join(E2E_SANDBOX, "repaired");
-  const mountRootDir = path.join(E2E_SANDBOX, "gdrive_mount");
+  const sqlitePath = path.join(E2E_SANDBOX, "outpost-v4-d1.sqlite");
+  const museWorkspaceDir = path.join(E2E_SANDBOX, "workspace-muse");
+  const argonWorkspaceDir = path.join(E2E_SANDBOX, "workspace-argon");
+  const batch1OrigDir = path.join(E2E_SANDBOX, "originals_muse_gpt");
+  const colabOrigDir = path.join(E2E_SANDBOX, "originals_muse_colab");
+  const argonFaceOrigDir = path.join(E2E_SANDBOX, "originals_argon_face");
+  const followupOrigDir = path.join(E2E_SANDBOX, "originals_followup");
 
-  fs.mkdirSync(workspaceDir, { recursive: true });
-  fs.mkdirSync(mountRootDir, { recursive: true });
+  fs.mkdirSync(museWorkspaceDir, { recursive: true });
+  fs.mkdirSync(argonWorkspaceDir, { recursive: true });
 
   const harness = await createTestHarness({
     sqlitePath,
     r2PageSize: 5, // Force cursor pagination across R2 list/delete on 12-item batch
     publicDir: PUBLIC_DIR,
     agentTokens: {
-      [AGENT_ID]: AGENT_TOKEN,
-      [OTHER_AGENT_ID]: OTHER_AGENT_TOKEN,
+      [MUSE_AGENT_ID]: MUSE_AGENT_TOKEN,
+      [ARGON_AGENT_ID]: ARGON_AGENT_TOKEN,
     },
     allowedEmails: "reviewer@example.test",
-    accessAud: "e2e-access-aud-tag-0001",
+    accessAud: "e2e-access-aud-tag-v4",
   });
 
   const srv = await startLocalWorkerServer(harness.env, "127.0.0.1");
+  const capturedAgentHeaders = [];
+  srv.server.on("request", (req) => {
+    if (req.url && req.url.startsWith("/api/agent/")) {
+      capturedAgentHeaders.push({
+        url: req.url,
+        headers: { ...req.headers },
+      });
+    }
+  });
   console.log(`[E2E] Live Worker HTTP server listening at ${srv.baseUrl}`);
 
-  const baseCliEnv = {
+  const museBaseEnv = {
     OUTPOST_URL: srv.baseUrl,
-    OUTPOST_AGENT_ID: AGENT_ID,
-    OUTPOST_TOKEN: AGENT_TOKEN,
-    OUTPOST_HOME: workspaceDir,
-    ARCHIVE_MODE: "connector",
-    ARCHIVE_LAYOUT: "ai_archive",
+    OUTPOST_AGENT_ID: MUSE_AGENT_ID,
+    OUTPOST_TOKEN: MUSE_AGENT_TOKEN,
+    OUTPOST_HOME: museWorkspaceDir,
   };
 
-  function runHubCli(cliArgs, extraEnv = {}) {
-    return runPython([HUB_CLIENT_PY, ...cliArgs], { ...baseCliEnv, ...extraEnv });
+  const argonBaseEnv = {
+    OUTPOST_URL: srv.baseUrl,
+    OUTPOST_AGENT_ID: ARGON_AGENT_ID,
+    OUTPOST_TOKEN: ARGON_AGENT_TOKEN,
+    OUTPOST_HOME: argonWorkspaceDir,
+  };
+
+  function runMuseCli(cliArgs, extraEnv = {}) {
+    return runPython([HUB_CLIENT_PY, ...cliArgs], { ...museBaseEnv, ...extraEnv });
+  }
+
+  function runArgonCli(cliArgs, extraEnv = {}) {
+    return runPython([HUB_CLIENT_PY, ...cliArgs], { ...argonBaseEnv, ...extraEnv });
   }
 
   try {
@@ -181,10 +221,10 @@ async function main() {
     });
 
     // =========================================================================
-    // 0. Exhaustive 3-Way Rule 3 Bucket Parity (Worker TS vs Frontend JS vs Agent PY)
+    // 0. Exhaustive 80-Combination 3-Way Orthogonal Parity (Worker TS == Frontend JS == Agent PY)
     // =========================================================================
-    logStep("0. Exhaustive 64-case Rule 3 Bucket Parity (src/buckets.ts == public/app.js == agent/hub_client.py)");
-    const tiers = [null, 1, 2, 3];
+    logStep("0. Exhaustive 80-Case 3-Way Disposition Parity (src/buckets.ts == public/app.js == agent/hub_client.py)");
+    const tiers = [3, 2, 1, 0, null];
     const flagAtoms = ["H", "F", "O", "R"];
     const testCases = [];
     for (const tier of tiers) {
@@ -193,35 +233,72 @@ async function main() {
         testCases.push({ tier, flags });
       }
     }
+    assert.equal(testCases.length, 80);
 
-    const pyBucketProc = await runPython([
+    const pyDispProc = await runPython([
       "-c",
-      `import json, sys; sys.path.insert(0, "agent"); import hub_client; cases = json.loads(sys.argv[1]); print(json.dumps([hub_client.classify_bucket(c["tier"], c["flags"]) for c in cases]))`,
+      `import json, sys; sys.path.insert(0, "agent"); import hub_client; cases = json.loads(sys.argv[1]); print(json.dumps([hub_client.resolve_disposition(c["tier"], c["flags"]) for c in cases]))`,
       JSON.stringify(testCases),
     ]);
-    assert.equal(pyBucketProc.status, 0, pyBucketProc.stderr);
-    const pyBuckets = JSON.parse(pyBucketProc.stdout);
+    assert.equal(pyDispProc.status, 0, pyDispProc.stderr);
+    const pyDispositions = JSON.parse(pyDispProc.stdout);
 
     testCases.forEach((tc, idx) => {
-      const bBucket = backendResolveBucket(tc.tier, tc.flags);
-      const fBucket = frontendComputeBucket(tc.tier, tc.flags);
-      const pBucket = pyBuckets[idx];
-      assert.equal(fBucket, bBucket, `Frontend != Backend for ${JSON.stringify(tc)}`);
-      assert.equal(pBucket, bBucket, `Python != Backend for ${JSON.stringify(tc)}`);
+      const bDisp = backendResolveDisposition(tc.tier, tc.flags);
+      const fDisp = frontendComputeDisposition(tc.tier, tc.flags);
+      const pDisp = pyDispositions[idx];
+
+      assert.deepEqual(fDisp, bDisp, `Frontend != Backend for ${JSON.stringify(tc)}`);
+      assert.equal(pDisp.destination, bDisp.destination, `Python destination != Backend for ${JSON.stringify(tc)}`);
+      assert.equal(pDisp.redraw, bDisp.redraw, `Python redraw != Backend for ${JSON.stringify(tc)}`);
+
+      // Verify zero-swallow of tier = 0 across all 3 layers!
+      if (tc.tier === 0) {
+        assert.equal(backendIsItemJudged(0, tc.flags, ""), true);
+        assert.equal(frontendIsItemJudged({ tier: 0, flags: tc.flags, note: "" }), true);
+        if (bDisp.destination === "archive") {
+          assert.equal(pDisp.final_tier, 0);
+          assert.equal(pDisp.intent_tier, null);
+        } else if (bDisp.destination === "repair") {
+          assert.equal(pDisp.intent_tier, 0);
+          assert.equal(pDisp.final_tier, null);
+        }
+      }
     });
-    console.log(`[E2E] Verified 64/64 (tier x flags) combinations match across Backend, Frontend, and Agent CLI.`);
+
+    const bAgg = backendComputeBatchCounts(testCases);
+    const fAgg = frontendComputeBatchCounts(testCases.map((c) => ({ ...c, note: "" })));
+    assert.deepEqual(fAgg.counts, bAgg);
+    assert.equal(bAgg.archive + bAgg.repair + bAgg.discard, 80);
+
+    // Verify Frontend §5.3 badge text & filter visibility linkage
+    assert.equal(frontendFormatBadge(3, ["R"], "artwork"), "★★★ 神图 · 重抽");
+    assert.equal(frontendFormatBadge(3, ["R"], "face"), "★★★ 核心锚 · 重抽");
+    assert.equal(frontendFormatBadge(0, [], "artwork"), "☆ 收藏");
+    assert.equal(frontendFormatBadge(0, [], "outfit"), "☆ 留样");
+    assert.equal(frontendFormatBadge(3, ["H", "R"], "artwork"), "待修复(意向★★★) · H · 重抽");
+    assert.equal(frontendFormatBadge(0, ["H"], "artwork"), "待修复(意向☆) · H");
+    assert.equal(frontendFormatBadge(null, ["R"], "artwork"), "仅重抽（原图不收）");
+
+    assert.equal(frontendMatchesFilter({ tier: 3, flags: ["R"] }, "archive"), true);
+    assert.equal(frontendMatchesFilter({ tier: 3, flags: ["R"] }, "redraw"), true);
+    assert.equal(frontendMatchesFilter({ tier: 3, flags: ["H", "R"] }, "repair"), true);
+    assert.equal(frontendMatchesFilter({ tier: 3, flags: ["H", "R"] }, "redraw"), true);
+    assert.equal(frontendMatchesFilter({ tier: null, flags: ["R"] }, "discard"), true);
+    assert.equal(frontendMatchesFilter({ tier: null, flags: ["R"] }, "redraw"), true);
+    console.log("[E2E] Verified 80/80 (tier x flags) combinations + zero-swallow tier=0 + badge/filter linkage.");
 
     // =========================================================================
-    // 1. Spec §11 Criterion 5 (Part A) — Unauthenticated & Bad Token Rejection
+    // 1. Access RS256 Auth, noindex Headers, Static Assets, Agent Auth & Path Guard
     // =========================================================================
-    logStep("1. Spec §11 (5) — Unauthenticated / Invalid JWT / Bad Agent Token Access Control");
+    logStep("1. Access RS256 JWT Gate, Security Headers, Static Assets & Path Guard");
     for (const route of [
       "/",
       "/app.js",
       "/styles.css",
       "/robots.txt",
       "/api/review/batches",
-      "/api/review/previews/20261113-muse-main-01/20261113-muse-main-01-001/1",
+      "/api/review/previews/20261119-museai-gpt-01/20261119-museai-gpt-01-001/1",
     ]) {
       const noJwtRes = await fetch(`${srv.baseUrl}${route}`);
       assert.equal(noJwtRes.status, 401, `Expected 401 without JWT on ${route}`);
@@ -230,27 +307,28 @@ async function main() {
       const tamperedRes = await fetch(`${srv.baseUrl}${route}`, {
         headers: { "Cf-Access-Jwt-Assertion": validJwt.slice(0, -5) + "ZZZZZ" },
       });
-      assert.equal(tamperedRes.status, 401, `Expected 401 with tampered JWT on ${route}`);
+      assert.equal(tamperedRes.status, 401);
 
       const wrongKeyRes = await fetch(`${srv.baseUrl}${route}`, {
         headers: { "Cf-Access-Jwt-Assertion": wrongKeyJwt },
       });
-      assert.equal(wrongKeyRes.status, 401, `Expected 401 with rogue RSA key on ${route}`);
+      assert.equal(wrongKeyRes.status, 401);
 
       const expiredRes = await fetch(`${srv.baseUrl}${route}`, {
         headers: { "Cf-Access-Jwt-Assertion": expiredJwt },
       });
-      assert.equal(expiredRes.status, 401, `Expected 401 with expired JWT on ${route}`);
+      assert.equal(expiredRes.status, 401);
 
       const wrongEmailRes = await fetch(`${srv.baseUrl}${route}`, {
         headers: { "Cf-Access-Jwt-Assertion": unauthorizedEmailJwt },
       });
-      assert.equal(wrongEmailRes.status, 403, `Expected 403 with non-allowlisted email on ${route}`);
+      assert.equal(wrongEmailRes.status, 403);
     }
 
     for (const [method, agentRoute] of [
       ["POST", "/api/agent/push"],
-      ["GET", "/api/agent/verdicts?batch_id=20261113-muse-main-01"],
+      ["GET", "/api/agent/verdicts?batch_id=20261119-museai-gpt-01"],
+      ["GET", "/api/agent/batches"],
       ["POST", "/api/agent/ack"],
     ]) {
       const noTok = await fetch(`${srv.baseUrl}${agentRoute}`, { method });
@@ -264,66 +342,7 @@ async function main() {
       assertSecurityHeaders(badTok, `bad-agent-token ${agentRoute}`);
     }
 
-    // Verify bad agent token via real hub_client.py subprocess returns 401 failure
-    const badTokCliProc = await runHubCli(["pull", "--batch", "20261113-muse-main-01"], {
-      OUTPOST_TOKEN: "invalid-agent-token-xyz",
-    });
-    assert.notEqual(badTokCliProc.status, 0, "CLI must fail with bad OUTPOST_TOKEN");
-    assert.match(badTokCliProc.stdout + badTokCliProc.stderr, /401/);
-
-    // Verify strict /tmp rejection in real CLI subprocess
-    const tmpRejectProc = await runHubCli([
-      "cleanup-trash",
-      "--workspace-dir",
-      "/tmp/forbidden-e2e",
-    ]);
-    assert.equal(tmpRejectProc.status, 2, "CLI must reject /tmp workspace with exit code 2");
-    assert.equal(JSON.parse(tmpRejectProc.stdout).error, "forbidden_storage_path");
-
-    // =========================================================================
-    // 2. Spec §11 Criterion 1 — Chunked Push (12 images = 10 + 2), Web UI, Previews & Verdicts
-    // =========================================================================
-    logStep("2. Spec §11 (1) — Chunked Push (12 images), Static Assets, Previews, Metadata & Verdicts");
-    const batch1Id = "20261113-muse-main-01";
-    const batch1Specs = [];
-    const dimensionsCycle = [
-      [832, 1216], // portrait
-      [1024, 1024], // square
-      [1344, 768], // landscape
-    ];
-    for (let i = 1; i <= 12; i++) {
-      const [w, h] = dimensionsCycle[(i - 1) % dimensionsCycle.length];
-      const name = `art_${String(i).padStart(3, "0")}.png`;
-      batch1Specs.push({
-        path: path.join(batch1OrigDir, name),
-        width: w,
-        height: h,
-        color: [20 + i * 10, 60 + i * 8, 120 + i * 5],
-        prompt: `masterpiece prompt #${i}, cinematic lighting`,
-      });
-    }
-    await createSamplePngs(batch1Specs);
-
-    // Push 12 images via real hub_client.py (default --chunk-size 10 -> 2 chunks: 10 + 2)
-    const push1Proc = await runHubCli(["push", batch1OrigDir, "--batch", batch1Id]);
-    assert.equal(push1Proc.status, 0, `hub_client.py push failed: ${push1Proc.stderr}`);
-    const push1Out = JSON.parse(push1Proc.stdout);
-    assert.equal(push1Out.batch_id, batch1Id);
-    assert.equal(push1Out.pushed_count, 12);
-    assert.equal(push1Out.accepted.length, 12);
-    assert.deepEqual(push1Out.rejected, []);
-    assert.equal(push1Out.chunks, 2);
-
-    // Verify ledger-muse-main.jsonl was written with all 12 pushed entries + preview_sha256
-    const ledgerPath = path.join(workspaceDir, `ledger-${AGENT_ID}.jsonl`);
-    const pushedLedgerEntries = readJsonl(ledgerPath);
-    assert.equal(pushedLedgerEntries.length, 12);
-    assert.ok(pushedLedgerEntries.every((e) => e.state === "pushed" && e.preview_sha256?.length === 64));
-
-    // Verify R2 holds 12 private WebP objects
-    assert.equal(harness.r2.keys(`previews/${AGENT_ID}/${batch1Id}/`).length, 12);
-
-    // Fetch real Static Assets (/, /app.js, /styles.css, /robots.txt) with valid RS256 Access JWT
+    // Verify static HTML & JS load with valid JWT and contain v4 UI elements + noindex meta
     const indexRes = await fetch(`${srv.baseUrl}/`, {
       headers: { "Cf-Access-Jwt-Assertion": validJwt },
     });
@@ -332,7 +351,6 @@ async function main() {
     const indexHtml = await indexRes.text();
     assert.match(indexHtml, /noindex,\s*nofollow,\s*noarchive/);
     assert.match(indexHtml, /撤回审完状态/);
-    assert.match(indexHtml, /mode-grid/);
 
     const appJsRes = await fetch(`${srv.baseUrl}/app.js`, {
       headers: { "Cf-Access-Jwt-Assertion": validJwt },
@@ -340,56 +358,230 @@ async function main() {
     assert.equal(appJsRes.status, 200);
     assertSecurityHeaders(appJsRes, "GET /app.js");
     const appJsText = await appJsRes.text();
-    assert.match(appJsText, /aspectRatio/);
+    assert.match(appJsText, /computeDisposition/);
 
-    // Fetch batch detail via /api/review/batches/:id and verify D1 metadata (width, height, filename)
+    // Verify strict forbidden system temp path rejection in real CLI subprocess
+    const forbiddenPath = path.join(forbiddenTmpPrefix, "forbidden-outpost-e2e");
+    const tmpRejectProc = await runMuseCli(["batches", "--workspace-dir", forbiddenPath]);
+    assert.equal(tmpRejectProc.status, 2, "CLI must reject forbidden temp workspace with exit 2");
+    assert.equal(JSON.parse(tmpRejectProc.stdout).error, "forbidden_storage_path");
+
+    // =========================================================================
+    // 2. flock Batch Reservation, Multi-Channel Push, --anonymize-names,
+    //    --parent-map, Sidecar generation_context & CF-Access Service Headers
+    // =========================================================================
+    logStep("2. flock Auto-Batch ID, Multi-Channel Push, Blind Anonymization, Lineage & CF-Access Headers");
+    const dimensionsCycle = [
+      [832, 1216],
+      [1024, 1024],
+      [1344, 768],
+    ];
+    const batch1Specs = [];
+    for (let i = 1; i <= 12; i++) {
+      const [w, h] = dimensionsCycle[(i - 1) % dimensionsCycle.length];
+      const realName = `secret_gpt_seed_${String(i).padStart(3, "0")}.png`;
+      batch1Specs.push({
+        path: path.join(batch1OrigDir, realName),
+        width: w,
+        height: h,
+        color: [20 + i * 10, 50 + i * 8, 110 + i * 6],
+        prompt: `cinematic portrait prompt #${i}`,
+        context_json: {
+          model: "gpt-image-1",
+          seed: 1000 + i,
+          prompt: `cinematic portrait prompt #${i}`,
+          face_anchor: "anchor_03",
+        },
+      });
+    }
+    await createSamplePngs(batch1Specs);
+
+    // Push 12 images WITHOUT --batch (tests flock auto-reservation `<YYYYMMDD>-museai-gpt-01`),
+    // with --chunk-size 5 (3 chunks: 5+5+2), --anonymize-names, and CF_ACCESS_CLIENT_ID/SECRET!
+    capturedAgentHeaders.length = 0;
+    const push1Proc = await runMuseCli(
+      [
+        "push",
+        batch1OrigDir,
+        "--source",
+        "museai",
+        "--line",
+        "gpt",
+        "--chunk-size",
+        "5",
+        "--anonymize-names",
+      ],
+      {
+        CF_ACCESS_CLIENT_ID: "dummy-cf-service-client-id.access",
+        CF_ACCESS_CLIENT_SECRET: "dummy-cf-service-client-secret-placeholder",
+      }
+    );
+    assert.equal(push1Proc.status, 0, `hub_client.py push failed: ${push1Proc.stderr}`);
+    const push1Out = JSON.parse(push1Proc.stdout);
+    const batch1Id = push1Out.batch_id;
+    assert.match(batch1Id, /^\d{8}-museai-gpt-01$/);
+    assert.equal(push1Out.source, "museai");
+    assert.equal(push1Out.line, "gpt");
+    assert.equal(push1Out.channel_id, "museai-gpt");
+    assert.equal(push1Out.batch_type, "artwork");
+    assert.equal(push1Out.anonymized_names, true);
+    assert.equal(push1Out.pushed_count, 12);
+    assert.equal(push1Out.chunks, 3);
+
+    // Verify CF-Access-Client-Id and CF-Access-Client-Secret headers were transmitted across all 3 chunk HTTP requests!
+    const pushHeaderHits = capturedAgentHeaders.filter((h) => h.url === "/api/agent/push");
+    assert.equal(pushHeaderHits.length, 3, "Expected 3 chunked /api/agent/push HTTP requests");
+    for (const hit of pushHeaderHits) {
+      assert.equal(hit.headers["cf-access-client-id"], "dummy-cf-service-client-id.access");
+      assert.equal(
+        hit.headers["cf-access-client-secret"],
+        "dummy-cf-service-client-secret-placeholder"
+      );
+    }
+
+    // Verify local ledger recorded `batch_reserved` FIRST, preserved real filename & generation_context
+    const museLedgerPath = path.join(museWorkspaceDir, `ledger-${MUSE_AGENT_ID}.jsonl`);
+    const museLedgerInitial = readJsonl(museLedgerPath);
+    assert.equal(museLedgerInitial[0].event, "batch_reserved");
+    assert.equal(museLedgerInitial[0].batch_id, batch1Id);
+    const pushedEntries1 = museLedgerInitial.filter((r) => r.state === "pushed" && r.batch_id === batch1Id);
+    assert.equal(pushedEntries1.length, 12);
+    assert.equal(pushedEntries1[0].filename, "secret_gpt_seed_001.png");
+    assert.equal(pushedEntries1[0].display_filename, "001.webp");
+    assert.equal(pushedEntries1[0].generation_context.model, "gpt-image-1");
+    assert.equal(pushedEntries1[0].generation_context.seed, 1001);
+
+    // Verify cloud batch received ONLY anonymized `001.webp`..`012.webp` and zero generation_context leak!
     const detail1Res = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}`, {
       headers: { "Cf-Access-Jwt-Assertion": validJwt },
     });
     assert.equal(detail1Res.status, 200);
-    assertSecurityHeaders(detail1Res, "GET /api/review/batches/:id");
     const detail1Json = await detail1Res.json();
-    assert.equal(detail1Json.batch.pushed_count, 12);
-    assert.equal(detail1Json.batch.review_done, false);
+    assert.equal(detail1Json.batch.channel_id, "museai-gpt");
+    assert.equal(detail1Json.batch.batch_type, "artwork");
     assert.equal(detail1Json.items.length, 12);
-    assert.equal(detail1Json.items[0].filename, "art_001.png");
+    assert.equal(detail1Json.items[0].filename, "001.webp");
+    assert.equal(detail1Json.items[11].filename, "012.webp");
+    assert.equal("generation_context" in detail1Json.items[0], false);
     assert.equal(detail1Json.items[0].width, 832);
     assert.equal(detail1Json.items[0].height, 1216);
-    assert.equal(detail1Json.items[1].width, 1024);
-    assert.equal(detail1Json.items[1].height, 1024);
-    assert.equal(detail1Json.items[2].width, 1344);
-    assert.equal(detail1Json.items[2].height, 768);
 
-    // Fetch real R2 preview via Worker route: verify 401 without JWT, 200 WebP matching ledger sha256 with JWT
-    const item001PreviewUrl = `${srv.baseUrl}${detail1Json.items[0].preview_url}`;
-    const unauthPreviewRes = await fetch(item001PreviewUrl);
-    assert.equal(unauthPreviewRes.status, 401, "Live preview must reject unauthenticated fetch");
-
-    const authPreviewRes = await fetch(item001PreviewUrl, {
+    // Verify R2 WebP stream matches ledger preview_sha256
+    const previewRes = await fetch(`${srv.baseUrl}${detail1Json.items[0].preview_url}`, {
       headers: { "Cf-Access-Jwt-Assertion": validJwt },
     });
-    assert.equal(authPreviewRes.status, 200);
-    assert.equal(authPreviewRes.headers.get("content-type"), "image/webp");
-    assertSecurityHeaders(authPreviewRes, "GET preview WebP");
-    const previewBytes = Buffer.from(await authPreviewRes.arrayBuffer());
-    assert.equal(previewBytes.subarray(0, 4).toString("ascii"), "RIFF");
-    assert.equal(previewBytes.subarray(8, 12).toString("ascii"), "WEBP");
+    assert.equal(previewRes.status, 200);
+    assertSecurityHeaders(previewRes, "GET WebP preview");
+    const previewBytes = Buffer.from(await previewRes.arrayBuffer());
     const previewSha = crypto.createHash("sha256").update(previewBytes).digest("hex");
-    assert.equal(previewSha, pushedLedgerEntries[0].preview_sha256);
+    assert.equal(previewSha, pushedEntries1[0].preview_sha256);
 
-    // Cross-agent isolation check against live batch
-    const crossAgentRes = await fetch(`${srv.baseUrl}/api/agent/verdicts?batch_id=${batch1Id}`, {
-      headers: {
-        Authorization: `Bearer ${OTHER_AGENT_TOKEN}`,
-        "X-Agent-Id": OTHER_AGENT_ID,
+    // Push a second pipeline batch for muse-main (`museai-colab`, `服装` -> `outfit`)
+    await createSamplePngs([
+      {
+        path: path.join(colabOrigDir, "outfit_cand_01.png"),
+        width: 1024,
+        height: 1536,
+        color: [140, 80, 160],
+        prompt: "linen coat anchor",
       },
-    });
-    assert.equal(crossAgentRes.status, 403);
+    ]);
+    const pushColabProc = await runMuseCli([
+      "push",
+      colabOrigDir,
+      "--source",
+      "museai",
+      "--line",
+      "colab",
+      "--batch-type",
+      "服装",
+    ]);
+    assert.equal(pushColabProc.status, 0, pushColabProc.stderr);
+    const pushColabOut = JSON.parse(pushColabProc.stdout);
+    const colabBatchId = pushColabOut.batch_id;
+    assert.match(colabBatchId, /^\d{8}-museai-colab-01$/);
+    assert.equal(pushColabOut.batch_type, "outfit");
 
-    // Reviewer applies 1/2/3 tiers (including toggle back to null & re-set) + H/F/O/R stackable flags + N notes
-    async function patchVerdict(seqNum, payload, round = 1) {
+    // Push a third batch from `argon-mac` (`gallery-banana`, Chinese alias `脸模` -> `face`, with `--parent-map`)
+    await createSamplePngs([
+      {
+        path: path.join(argonFaceOrigDir, "face_cand_a.png"),
+        width: 1024,
+        height: 1024,
+        color: [180, 120, 90],
+        prompt: "face candidate A",
+      },
+      {
+        path: path.join(argonFaceOrigDir, "face_cand_b.png"),
+        width: 1024,
+        height: 1024,
+        color: [190, 130, 100],
+        prompt: "face candidate B",
+      },
+    ]);
+    const parentMapJson = JSON.stringify({
+      "face_cand_a.png": "20261101-gallery-banana-01-007",
+      "face_cand_b.png": "20261101-gallery-banana-01-007", // Same parent -> multiple candidates!
+    });
+    const pushArgonProc = await runArgonCli([
+      "push",
+      argonFaceOrigDir,
+      "--source",
+      "gallery",
+      "--line",
+      "banana",
+      "--batch-type",
+      "脸模",
+      "--parent-map",
+      parentMapJson,
+    ]);
+    assert.equal(pushArgonProc.status, 0, pushArgonProc.stderr);
+    const pushArgonOut = JSON.parse(pushArgonProc.stdout);
+    const argonBatchId = pushArgonOut.batch_id;
+    assert.match(argonBatchId, /^\d{8}-gallery-banana-01$/);
+    assert.equal(pushArgonOut.batch_type, "face");
+
+    // Verify parent_item_id on cloud review endpoint
+    const argonDetailRes = await fetch(`${srv.baseUrl}/api/review/batches/${argonBatchId}`, {
+      headers: { "Cf-Access-Jwt-Assertion": validJwt },
+    });
+    const argonDetailJson = await argonDetailRes.json();
+    assert.equal(argonDetailJson.batch.batch_type, "face");
+    assert.equal(argonDetailJson.items[0].parent_item_id, "20261101-gallery-banana-01-007");
+    assert.equal(argonDetailJson.items[1].parent_item_id, "20261101-gallery-banana-01-007");
+
+    // Verify `hub_client.py batches` multi-pipeline polling & per-agent isolation
+    const museAllBatches = JSON.parse((await runMuseCli(["batches"])).stdout);
+    assert.equal(museAllBatches.batches.length, 2);
+    const museGptOnly = JSON.parse((await runMuseCli(["batches", "--line", "gpt"])).stdout);
+    assert.equal(museGptOnly.batches.length, 1);
+    assert.equal(museGptOnly.batches[0].batch_id, batch1Id);
+    const argonBatches = JSON.parse((await runArgonCli(["batches"])).stdout);
+    assert.equal(argonBatches.batches.length, 1);
+    assert.equal(argonBatches.batches[0].batch_id, argonBatchId);
+
+    // =========================================================================
+    // 3. Reviewer 4-Star Grading (3/2/1/0/null), Orthogonal Flags, Channels Bar & Lock/Revoke
+    // =========================================================================
+    logStep("3. Reviewer 4-Star Grading (including tier = 0), Dynamic Channels Bar & Lock/Revoke/Re-lock");
+
+    // Check `/api/review/batches` dynamic `channels` aggregation & `?channel=` filtering
+    const reviewListRes = await fetch(`${srv.baseUrl}/api/review/batches?channel=museai-gpt`, {
+      headers: { "Cf-Access-Jwt-Assertion": validJwt },
+    });
+    assert.equal(reviewListRes.status, 200);
+    const reviewListJson = await reviewListRes.json();
+    assert.equal(reviewListJson.batches.length, 1);
+    assert.equal(reviewListJson.batches[0].batch_id, batch1Id);
+    assert.deepEqual(reviewListJson.channels, [
+      { channel_id: "gallery-banana", source: "gallery", line: "banana", total_batches: 1, pending_batches: 1 },
+      { channel_id: "museai-colab", source: "museai", line: "colab", total_batches: 1, pending_batches: 1 },
+      { channel_id: "museai-gpt", source: "museai", line: "gpt", total_batches: 1, pending_batches: 1 },
+    ]);
+
+    async function patchBatch1Item(seqNum, payload, round = 1) {
       const itemId = `${batch1Id}-${String(seqNum).padStart(3, "0")}`;
-      const res = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/items/${itemId}/${round}`, {
+      return fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/items/${itemId}/${round}`, {
         method: "PATCH",
         headers: {
           "Cf-Access-Jwt-Assertion": validJwt,
@@ -397,67 +589,56 @@ async function main() {
         },
         body: JSON.stringify(payload),
       });
-      return res;
     }
 
-    // Toggle test on item 001: 1 -> null -> 1
-    assert.equal((await patchVerdict(1, { tier: 1 })).status, 200);
-    const toggledNullRes = await patchVerdict(1, { tier: null });
-    assert.equal(toggledNullRes.status, 200);
-    assert.equal((await toggledNullRes.json()).item.tier, null);
-    assert.equal((await patchVerdict(1, { tier: 1, flags: [], note: "神图收录" })).status, 200);
+    // Toggle check on item 001: 3 -> null -> 3
+    assert.equal((await patchBatch1Item(1, { tier: 3 })).status, 200);
+    assert.equal((await (await patchBatch1Item(1, { tier: null })).json()).item.tier, null);
+    assert.equal((await patchBatch1Item(1, { tier: 3, note: "神图入库" })).status, 200);
 
-    // Remaining judgments across all buckets:
-    assert.equal((await patchVerdict(2, { tier: 2, flags: [], note: "心动光影" })).status, 200);
-    assert.equal((await patchVerdict(3, { tier: 3, flags: [] })).status, 200);
-    assert.equal(
-      (await patchVerdict(4, { tier: 1, flags: ["H"], note: "修左手食指，保留1档" })).status,
-      200
-    );
-    assert.equal(
-      (await patchVerdict(5, { tier: 2, flags: ["F", "O"], note: "修脚部与背景杂物" })).status,
-      200
-    );
-    assert.equal((await patchVerdict(6, { tier: 1, flags: ["H", "R"] })).status, 200); // H beats R -> repair
-    assert.equal((await patchVerdict(7, { tier: null, flags: ["R"], note: "重抽一版" })).status, 200);
-    assert.equal((await patchVerdict(8, { tier: 3, flags: ["R"] })).status, 200); // R beats tier -> redraw
-    assert.equal((await patchVerdict(9, { tier: null, flags: [], note: "构图散乱不收" })).status, 200);
-    // Items 010, 011, 012 left unjudged for now
+    // Diverse v4 verdicts across items 002..011 (leaving 012 unjudged before revoke):
+    // 001: tier=3               -> archive
+    // 002: tier=2               -> archive
+    // 003: tier=1               -> archive
+    // 004: tier=0               -> archive (0-star collection!)
+    // 005: tier=3 + R           -> archive + redraw=true
+    // 006: tier=0 + R           -> archive + redraw=true (0-star + redraw!)
+    // 007: tier=3 + H           -> repair (intent_tier=3) + redraw=false
+    // 008: tier=0 + F + O       -> repair (intent_tier=0) + redraw=false
+    // 009: tier=2 + H + R       -> repair (intent_tier=2) + redraw=true
+    // 010: null + R             -> discard + redraw=true
+    // 011: null + note          -> discard + redraw=false
+    // 012: untouched initially  -> discard -> revoked & changed to tier=1 (archive)
+    assert.equal((await patchBatch1Item(2, { tier: 2 })).status, 200);
+    assert.equal((await patchBatch1Item(3, { tier: 1 })).status, 200);
+    assert.equal((await patchBatch1Item(4, { tier: 0, note: "0星收藏测试" })).status, 200);
+    assert.equal((await patchBatch1Item(5, { tier: 3, flags: ["R"] })).status, 200);
+    assert.equal((await patchBatch1Item(6, { tier: 0, flags: ["R"] })).status, 200);
+    assert.equal((await patchBatch1Item(7, { tier: 3, flags: ["H"], note: "修左手拇指" })).status, 200);
+    assert.equal((await patchBatch1Item(8, { tier: 0, flags: ["F", "O"] })).status, 200);
+    assert.equal((await patchBatch1Item(9, { tier: 2, flags: ["H", "R"] })).status, 200);
+    assert.equal((await patchBatch1Item(10, { flags: ["R"], note: "仅重抽" })).status, 200);
+    assert.equal((await patchBatch1Item(11, { note: "构图杂乱不收" })).status, 200);
 
-    // =========================================================================
-    // 3. Spec §11 Criterion 2 — Reject Ack Before Done, Lock/Revoke, Pull Verdicts
-    // =========================================================================
-    logStep("3. Spec §11 (2) — Premature Ack Rejection, review_done Lock/Revoke, and hub_client.py pull");
+    // Premature CLI ack & HTTP ack before review_done=true -> rejected!
+    const prematureCliAck = await runMuseCli(["ack", "--batch", batch1Id]);
+    assert.equal(prematureCliAck.status, 2);
+    assert.match(prematureCliAck.stdout, /review_not_done/);
 
-    // Pull while review_done=false -> read-only, does NOT move discarded items to _trash
-    const earlyPullProc = await runHubCli(["pull", "--batch", batch1Id]);
-    assert.equal(earlyPullProc.status, 0);
-    assert.equal(JSON.parse(earlyPullProc.stdout).review_done, false);
-    assert.ok(fs.existsSync(path.join(batch1OrigDir, "art_010.png")));
-
-    // CLI ack before review_done=true -> blocked
-    const earlyAckCli = await runHubCli(["ack", "--batch", batch1Id]);
-    assert.notEqual(earlyAckCli.status, 0);
-    assert.match(earlyAckCli.stdout, /review_not_done/);
-
-    // Direct HTTP POST /api/agent/ack before review_done=true -> 409 review_not_done
-    const earlyAckHttp = await fetch(`${srv.baseUrl}/api/agent/ack`, {
+    const prematureHttpAck = await fetch(`${srv.baseUrl}/api/agent/ack`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${AGENT_TOKEN}`,
-        "X-Agent-Id": AGENT_ID,
+        Authorization: `Bearer ${MUSE_AGENT_TOKEN}`,
+        "X-Agent-Id": MUSE_AGENT_ID,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        batch_id: batch1Id,
-        counts: { pushed: 12, archived: 3, repair: 3, redraw: 2, discarded: 4 },
-      }),
+      body: JSON.stringify({ batch_id: batch1Id, items: [] }),
     });
-    assert.equal(earlyAckHttp.status, 409);
-    assert.equal((await earlyAckHttp.json()).error, "review_not_done");
+    assert.equal(prematureHttpAck.status, 409);
+    assert.equal((await prematureHttpAck.json()).error, "review_not_done");
 
-    // Click「审完本批」(review_done: true)
-    const markDone1 = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/done`, {
+    // Lock batch (review_done: true) and verify review_done_at + 409 batch_locked
+    const lock1Res = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/done`, {
       method: "POST",
       headers: {
         "Cf-Access-Jwt-Assertion": validJwt,
@@ -465,15 +646,14 @@ async function main() {
       },
       body: JSON.stringify({ review_done: true }),
     });
-    assert.equal(markDone1.status, 200);
-    assert.equal((await markDone1.json()).batch.review_done, true);
+    assert.equal(lock1Res.status, 200);
+    const lock1Batch = (await lock1Res.json()).batch;
+    assert.equal(lock1Batch.review_done, true);
+    assert.ok(typeof lock1Batch.review_done_at === "string" && lock1Batch.review_done_at.length > 0);
+    assert.equal((await patchBatch1Item(12, { tier: 1 })).status, 409);
 
-    // Locked batch rejects PATCH with 409 batch_locked
-    const lockedPatch = await patchVerdict(12, { tier: 2 });
-    assert.equal(lockedPatch.status, 409);
-
-    // Click「撤回审完状态」(review_done: false) before ack, modify item 012 -> tier=2, then re-lock!
-    const revokeDone = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/done`, {
+    // Revoke review_done -> false, update item 012 to tier = 1 (archive), then re-lock!
+    const revokeRes = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/done`, {
       method: "POST",
       headers: {
         "Cf-Access-Jwt-Assertion": validJwt,
@@ -481,17 +661,14 @@ async function main() {
       },
       body: JSON.stringify({ review_done: false }),
     });
-    assert.equal(revokeDone.status, 200);
-    assert.equal((await revokeDone.json()).batch.review_done, false);
+    assert.equal(revokeRes.status, 200);
+    const revokedBatch = (await revokeRes.json()).batch;
+    assert.equal(revokedBatch.review_done, false);
+    assert.equal(revokedBatch.review_done_at, null);
 
-    const unlockedPatch12 = await patchVerdict(12, {
-      tier: 2,
-      flags: [],
-      note: "撤回审完后补收2档",
-    });
-    assert.equal(unlockedPatch12.status, 200);
+    assert.equal((await patchBatch1Item(12, { tier: 1, note: "撤回后补收1星" })).status, 200);
 
-    const markDone2 = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/done`, {
+    const lock2Res = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}/done`, {
       method: "POST",
       headers: {
         "Cf-Access-Jwt-Assertion": validJwt,
@@ -499,318 +676,408 @@ async function main() {
       },
       body: JSON.stringify({ review_done: true }),
     });
-    assert.equal(markDone2.status, 200);
+    assert.equal(lock2Res.status, 200);
+    assert.ok((await lock2Res.json()).batch.review_done_at);
 
-    // Run real hub_client.py pull
-    const pull1Proc = await runHubCli(["pull", "--batch", batch1Id]);
+    // =========================================================================
+    // 4. Read-Only `pull`, `mark-archived` Guard, 409 Server Gates & Full `ack` Purge
+    // =========================================================================
+    logStep("4. Read-Only pull (Zero File Movement), mark-archived Guard, Ack 409 Gates & Full Purge");
+
+    const pull1Proc = await runMuseCli(["pull", "--batch", batch1Id]);
     assert.equal(pull1Proc.status, 0, `hub_client.py pull failed: ${pull1Proc.stderr}`);
     const pull1Out = JSON.parse(pull1Proc.stdout);
-    const expectedBatch1Counts = {
-      pushed: 12,
-      archived: 4, // 001, 002, 003, 012
-      repair: 3, // 004 (tier 1 + H), 005 (tier 2 + F,O), 006 (tier 1 + H,R)
-      redraw: 2, // 007 (R), 008 (tier 3 + R)
-      discarded: 3, // 009 (note only), 010, 011
-    };
     assert.equal(pull1Out.review_done, true);
-    assert.deepEqual(pull1Out.counts, expectedBatch1Counts);
-
-    // Verify discarded originals (009, 010, 011) moved to _trash/<batch1Id>/
-    for (const trashedName of ["art_009.png", "art_010.png", "art_011.png"]) {
-      assert.ok(!fs.existsSync(path.join(batch1OrigDir, trashedName)), `${trashedName} should leave originals`);
-      assert.ok(
-        fs.existsSync(path.join(workspaceDir, "_trash", batch1Id, trashedName)),
-        `${trashedName} should exist in _trash`
-      );
-    }
-
-    // Verify repair item 004 preserved tier=1 in local ledger
-    const ledgerAfterPull1 = readJsonl(ledgerPath);
-    const repair004 = ledgerAfterPull1.find(
-      (r) => r.item_id === `${batch1Id}-004` && r.round === 1 && r.state === "repair"
-    );
-    assert.ok(repair004, "Missing state=repair ledger record for item 004");
-    assert.equal(repair004.verdict.tier, 1);
-    assert.deepEqual(repair004.verdict.flags, ["H"]);
-
-    // =========================================================================
-    // 4. Spec §11 Criterion 3 — Ack 409 Count Mismatch, Connector Gate, Backfill & Purge
-    // =========================================================================
-    logStep("4. Spec §11 (3) — Ack 409 Count Mismatch, Connector Pre-Ack Gate, Backfill & Physical Purge");
-
-    // Tampered count submission -> HTTP 409 counts_mismatch + cloud_counts returned, 0 deletions
-    const mismatchAckRes = await fetch(`${srv.baseUrl}/api/agent/ack`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${AGENT_TOKEN}`,
-        "X-Agent-Id": AGENT_ID,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        batch_id: batch1Id,
-        counts: { pushed: 12, archived: 5, repair: 2, redraw: 2, discarded: 3 },
-      }),
+    assert.deepEqual(pull1Out.counts, {
+      pushed: 12,
+      archive: 7, // 001, 002, 003, 004(tier 0), 005(3+R), 006(0+R), 012(1)
+      repair: 3, // 007(3+H), 008(0+F,O), 009(2+H,R)
+      discard: 2, // 010(R), 011(note)
+      redraw: 4, // 005, 006, 009, 010
     });
-    assert.equal(mismatchAckRes.status, 409);
-    const mismatchBody = await mismatchAckRes.json();
-    assert.equal(mismatchBody.error, "counts_mismatch");
-    assert.deepEqual(mismatchBody.cloud_counts, expectedBatch1Counts);
-    assert.equal(harness.r2.keys(`previews/${AGENT_ID}/${batch1Id}/`).length, 12);
 
-    // Connector mode archive-plan outputs exact 4 archived items
-    const plan1Proc = await runHubCli(["archive-plan", "--batch", batch1Id]);
-    assert.equal(plan1Proc.status, 0, plan1Proc.stderr);
-    const plan1 = JSON.parse(plan1Proc.stdout);
-    assert.equal(plan1.archive_mode, "connector");
-    assert.equal(plan1.items.length, 4);
-    assert.equal(plan1.items[0].target_drive_path, `AI_Archive/${AGENT_ID}/${batch1Id}/art_001.png`);
-    assert.equal(plan1.items[0].prompt_target_drive_path, `AI_Archive/${AGENT_ID}/${batch1Id}/art_001.txt`);
+    // CRITICAL v4 RULE (§6.1.1): ALL 12 originals + .txt + .json sidecars MUST remain untouched in place!
+    for (let i = 1; i <= 12; i++) {
+      const stem = `secret_gpt_seed_${String(i).padStart(3, "0")}`;
+      assert.ok(fs.existsSync(path.join(batch1OrigDir, `${stem}.png`)), `Original ${stem}.png moved!`);
+      assert.ok(fs.existsSync(path.join(batch1OrigDir, `${stem}.txt`)), `Sidecar ${stem}.txt moved!`);
+      assert.ok(fs.existsSync(path.join(batch1OrigDir, `${stem}.json`)), `Sidecar ${stem}.json moved!`);
+    }
+    assert.equal(fs.existsSync(path.join(museWorkspaceDir, "_trash")), false, "_trash must NOT be created by pull");
 
-    // Connector mode pre-ack safety gate: refuses ack locally BEFORE drive_path backfill!
-    const blockedAckProc = await runHubCli(["ack", "--batch", batch1Id]);
-    assert.equal(blockedAckProc.status, 2);
-    const blockedAckJson = JSON.parse(blockedAckProc.stdout);
-    assert.equal(blockedAckJson.error, "ack_blocked_by_ledger_gate");
-    assert.equal(blockedAckJson.pending_uploads.length, 4);
-    // Cloud batch must still exist untouched
-    assert.equal(harness.r2.keys(`previews/${AGENT_ID}/${batch1Id}/`).length, 12);
+    // Verify ledger accurately stored final_tier (including 0!), intent_tier (including 0 & 3!), and repair_flags
+    const byId = new Map(pull1Out.items.map((it) => [it.item_id, it]));
+    assert.equal(byId.get(`${batch1Id}-004`).final_tier, 0);
+    assert.equal(byId.get(`${batch1Id}-006`).final_tier, 0);
+    assert.equal(byId.get(`${batch1Id}-006`).redraw, true);
+    assert.equal(byId.get(`${batch1Id}-007`).destination, "repair");
+    assert.equal(byId.get(`${batch1Id}-007`).intent_tier, 3);
+    assert.deepEqual(byId.get(`${batch1Id}-007`).repair_flags, ["H"]);
+    assert.equal(byId.get(`${batch1Id}-008`).destination, "repair");
+    assert.equal(byId.get(`${batch1Id}-008`).intent_tier, 0);
+    assert.deepEqual(byId.get(`${batch1Id}-008`).repair_flags, ["F", "O"]);
 
-    // Backfill item 001 via CLI flags and items 002, 003, 012 via --from-json
-    const markOneProc = await runHubCli([
+    // Verify `mark-archived` rejects repair (007) and discard (010) items with non-zero exit code!
+    const markRepairFail = await runMuseCli([
       "mark-archived",
       "--batch",
       batch1Id,
       "--item-id",
-      plan1.items[0].item_id,
-      "--drive-path",
-      plan1.items[0].target_drive_path,
+      `${batch1Id}-007`,
+      "--archive-ref",
+      "illegal/repair.png",
     ]);
-    assert.equal(markOneProc.status, 0, markOneProc.stderr);
+    assert.notEqual(markRepairFail.status, 0, "mark-archived must reject repair item");
 
-    const backfillJsonPath = path.join(E2E_SANDBOX, "connector-backfill.json");
-    const remainingMap = {};
-    for (const entry of plan1.items.slice(1)) {
-      remainingMap[entry.item_id] = entry.target_drive_path;
+    const markDiscardFail = await runMuseCli([
+      "mark-archived",
+      "--batch",
+      batch1Id,
+      "--item-id",
+      `${batch1Id}-010`,
+      "--archive-ref",
+      "illegal/discard.png",
+    ]);
+    assert.notEqual(markDiscardFail.status, 0, "mark-archived must reject discard item");
+
+    // Verify local pre-ack safety gate blocks `hub_client.py ack` before all 7 archive items have archive_ref!
+    const localBlockedAck = await runMuseCli(["ack", "--batch", batch1Id]);
+    assert.equal(localBlockedAck.status, 2);
+    const localBlockedJson = JSON.parse(localBlockedAck.stdout);
+    assert.equal(localBlockedJson.error, "ack_blocked_by_ledger_gate");
+    assert.equal(localBlockedJson.missing_items.length, 7);
+
+    // Verify server-side `POST /api/agent/ack` 409 gates directly (without deleting R2 or D1!):
+    const fullAckTemplate = pull1Out.items.map((it) => ({
+      item_id: it.item_id,
+      round: it.round,
+      destination: it.destination,
+      redraw: it.redraw,
+      archive_ref: it.destination === "archive" ? `vault/${it.item_id}.png` : null,
+    }));
+
+    // (a) Missing item -> 409 items_coverage_mismatch
+    const covMismatchRes = await fetch(`${srv.baseUrl}/api/agent/ack`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${MUSE_AGENT_TOKEN}`,
+        "X-Agent-Id": MUSE_AGENT_ID,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ batch_id: batch1Id, items: fullAckTemplate.slice(0, 11) }),
+    });
+    assert.equal(covMismatchRes.status, 409);
+    assert.equal((await covMismatchRes.json()).error, "items_coverage_mismatch");
+
+    // (b) Stale disposition (item 012 submitted as old pre-revoke "discard") -> 409 disposition_mismatch
+    const staleItems = fullAckTemplate.map((it) =>
+      it.item_id === `${batch1Id}-012` ? { ...it, destination: "discard", archive_ref: null } : it
+    );
+    const dispMismatchRes = await fetch(`${srv.baseUrl}/api/agent/ack`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${MUSE_AGENT_TOKEN}`,
+        "X-Agent-Id": MUSE_AGENT_ID,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ batch_id: batch1Id, items: staleItems }),
+    });
+    assert.equal(dispMismatchRes.status, 409);
+    assert.equal((await dispMismatchRes.json()).error, "disposition_mismatch");
+
+    // (c) Empty archive_ref on tier=0 archive item (004) -> 409 missing_archive_ref
+    const missingRefPayload = fullAckTemplate.map((it) =>
+      it.item_id === `${batch1Id}-004` ? { ...it, archive_ref: "  " } : it
+    );
+    const missingRefRes = await fetch(`${srv.baseUrl}/api/agent/ack`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${MUSE_AGENT_TOKEN}`,
+        "X-Agent-Id": MUSE_AGENT_ID,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ batch_id: batch1Id, items: missingRefPayload }),
+    });
+    assert.equal(missingRefRes.status, 409);
+    const missingRefJson = await missingRefRes.json();
+    assert.equal(missingRefJson.error, "missing_archive_ref");
+    assert.deepEqual(missingRefJson.missing_items, [`${batch1Id}-004`]);
+    assert.equal(harness.r2.keys(`previews/${MUSE_AGENT_ID}/${batch1Id}/`).length, 12);
+
+    // Backfill all 7 archive items in local ledger (testing --archive-ref, --drive-path alias, and --from-json)
+    const archiveItems = pull1Out.items.filter((it) => it.destination === "archive");
+    assert.equal(archiveItems.length, 7);
+
+    const m1 = await runMuseCli([
+      "mark-archived",
+      "--batch",
+      batch1Id,
+      "--item-id",
+      archiveItems[0].item_id,
+      "--archive-ref",
+      `gdrive:aigc/成图收录/神图/${archiveItems[0].item_id}.png`,
+    ]);
+    assert.equal(m1.status, 0, m1.stderr);
+
+    const m2 = await runMuseCli([
+      "mark-archived",
+      "--batch",
+      batch1Id,
+      "--item-id",
+      archiveItems[1].item_id,
+      "--drive-path",
+      `gdrive:aigc/成图收录/心动/${archiveItems[1].item_id}.png`,
+    ]);
+    assert.equal(m2.status, 0, m2.stderr);
+
+    const remainingArchiveMap = {};
+    for (const entry of archiveItems.slice(2)) {
+      remainingArchiveMap[entry.item_id] = `gdrive:aigc/成图收录/tier_${entry.final_tier}/${entry.item_id}.png`;
     }
-    fs.writeFileSync(backfillJsonPath, JSON.stringify(remainingMap, null, 2), "utf8");
+    const backfillJsonPath = path.join(E2E_SANDBOX, "archive-refs-batch1.json");
+    fs.writeFileSync(backfillJsonPath, JSON.stringify(remainingArchiveMap, null, 2), "utf8");
 
-    const markRestProc = await runHubCli([
+    const mRest = await runMuseCli([
       "mark-archived",
       "--batch",
       batch1Id,
       "--from-json",
       backfillJsonPath,
     ]);
-    assert.equal(markRestProc.status, 0, markRestProc.stderr);
+    assert.equal(mRest.status, 0, mRest.stderr);
 
-    // Now run hub_client.py ack -> must succeed and physically delete all 12 R2 objects + D1 rows!
-    const ack1Proc = await runHubCli(["ack", "--batch", batch1Id]);
+    // Execute real `hub_client.py ack` -> 200 OK with receipt, purging all 12 R2 previews & D1 rows!
+    const ack1Proc = await runMuseCli(["ack", "--batch", batch1Id]);
     assert.equal(ack1Proc.status, 0, `hub_client.py ack failed: ${ack1Proc.stderr}`);
-    const ack1Json = JSON.parse(ack1Proc.stdout);
-    assert.equal(ack1Json.ok, true);
-    assert.equal(ack1Json.cloud_response.deleted_previews, 12);
+    const ack1Out = JSON.parse(ack1Proc.stdout);
+    assert.equal(ack1Out.ok, true);
+    assert.equal(ack1Out.batch_id, batch1Id);
+    assert.equal(ack1Out.purged_previews, 12);
+    assert.deepEqual(ack1Out.receipt, {
+      archive: [
+        `${batch1Id}-001`,
+        `${batch1Id}-002`,
+        `${batch1Id}-003`,
+        `${batch1Id}-004`,
+        `${batch1Id}-005`,
+        `${batch1Id}-006`,
+        `${batch1Id}-012`,
+      ],
+      repair: [`${batch1Id}-007`, `${batch1Id}-008`, `${batch1Id}-009`],
+      discard: [`${batch1Id}-010`, `${batch1Id}-011`],
+      redraw: [`${batch1Id}-005`, `${batch1Id}-006`, `${batch1Id}-009`, `${batch1Id}-010`],
+    });
 
-    assert.equal(harness.r2.keys(`previews/${AGENT_ID}/${batch1Id}/`).length, 0);
-    const d1Batch1Row = await harness.db
-      .prepare("SELECT * FROM batches WHERE batch_id = ?")
-      .bind(batch1Id)
-      .first();
-    assert.equal(d1Batch1Row, null);
-    const d1Verdicts1 = await harness.db
-      .prepare("SELECT * FROM verdicts WHERE batch_id = ?")
-      .bind(batch1Id)
-      .all();
-    assert.equal(d1Verdicts1.results.length, 0);
-
-    const deletedBatchRes = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}`, {
+    assert.equal(harness.r2.keys(`previews/${MUSE_AGENT_ID}/${batch1Id}/`).length, 0);
+    assert.equal(
+      await harness.db.prepare("SELECT * FROM batches WHERE batch_id = ?").bind(batch1Id).first(),
+      null
+    );
+    const deletedRes = await fetch(`${srv.baseUrl}/api/review/batches/${batch1Id}`, {
       headers: { "Cf-Access-Jwt-Assertion": validJwt },
     });
-    assert.equal(deletedBatchRes.status, 404);
+    assert.equal(deletedRes.status, 404);
 
     // =========================================================================
-    // 5. Spec §11 Criterion 4 — ARCHIVE_MODE=mount Auto Archive + Backup + round+1 Re-push
+    // 5. Cutover Tools (`migrate_v4_cutover.py`), Legacy Ledger Mix & `round+1` / Redraw Lineage
     // =========================================================================
-    logStep("5. Spec §11 (4) — ARCHIVE_MODE=mount Full Auto-Archive + Ledger Backup + round+1 Cross-Batch Re-push");
-    const batch2Id = "20261113-muse-main-02";
-    const origRepairItemId = `${batch1Id}-004`; // Was tier=1 + H in batch 1
+    logStep("5. migrate_v4_cutover.py (mark-ledger + flip-star-table), Cutover Mix & round+1 / Redraw Lineage");
 
-    // Create repaired image WITHOUT sidecar .txt (verifies prompt carry-forward from round 1!)
-    // plus 2 fresh images for batch 2
+    // 5A. Test `flip-star-table` in-place atomic flip + symmetry verification
+    const starTablePath = path.join(E2E_SANDBOX, "face_anchors_stars.json");
+    fs.writeFileSync(
+      starTablePath,
+      JSON.stringify(
+        {
+          face_001: 1, // old 1 (god/core) -> 3
+          face_002: 1, // old 1 -> 3
+          face_003: 2, // stays 2
+          face_004: 3, // old 3 -> 1
+          face_005: 0, // stays 0
+          face_006: null, // stays null
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const flipProc = await runPython([
+      MIGRATE_CUTOVER_PY,
+      "flip-star-table",
+      "--file",
+      starTablePath,
+      "--in-place",
+    ]);
+    assert.equal(flipProc.status, 0, flipProc.stderr);
+    const flipOut = JSON.parse(flipProc.stdout);
+    assert.equal(flipOut.ok, true);
+    assert.equal(flipOut.before_counts["1"], 2);
+    assert.equal(flipOut.after_counts["3"], 2);
+    assert.equal(flipOut.before_counts["3"], 1);
+    assert.equal(flipOut.after_counts["1"], 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(starTablePath, "utf8")), {
+      face_001: 3,
+      face_002: 3,
+      face_003: 2,
+      face_004: 1,
+      face_005: 0,
+      face_006: null,
+    });
+
+    // 5B. Test `mark-ledger` idempotency + mixed pre/post cutover ledger parsing in `hub_client.py`
+    const mixedWsDir = path.join(E2E_SANDBOX, "workspace-cutover-mix");
+    fs.mkdirSync(mixedWsDir, { recursive: true });
+    const mixedLedgerPath = path.join(mixedWsDir, "ledger-muse-main.jsonl");
+    const preCutoverRows = [
+      {
+        item_id: "20261110-muse-main-01-001",
+        batch_id: "20261110-muse-main-01",
+        round: 1,
+        original_path: path.join(batch1OrigDir, "secret_gpt_seed_001.png"),
+        state: "archived",
+        verdict: { tier: 1, flags: [], note: "legacy tier 1 = 3 stars" },
+        drive_path: "AI_Archive/muse-main/legacy_001.png",
+      },
+      {
+        item_id: "20261110-muse-main-01-002",
+        batch_id: "20261110-muse-main-01",
+        round: 1,
+        original_path: path.join(batch1OrigDir, "secret_gpt_seed_002.png"),
+        state: "archived",
+        verdict: { tier: 3, flags: [], note: "legacy tier 3 = 1 star" },
+        drive_path: "AI_Archive/muse-main/legacy_002.png",
+      },
+    ];
+    fs.writeFileSync(
+      mixedLedgerPath,
+      preCutoverRows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8"
+    );
+
+    const markLedger1 = await runPython([
+      MIGRATE_CUTOVER_PY,
+      "mark-ledger",
+      "--ledger",
+      mixedLedgerPath,
+    ]);
+    assert.equal(markLedger1.status, 0, markLedger1.stderr);
+    assert.equal(JSON.parse(markLedger1.stdout).already_marked, false);
+
+    const markLedger2 = await runPython([
+      MIGRATE_CUTOVER_PY,
+      "mark-ledger",
+      "--ledger",
+      mixedLedgerPath,
+    ]);
+    assert.equal(markLedger2.status, 0, markLedger2.stderr);
+    assert.equal(JSON.parse(markLedger2.stdout).already_marked, true);
+
+    // Append a post-cutover v4 record with tier = 0 and verify Ledger parses both eras accurately
+    fs.appendFileSync(
+      mixedLedgerPath,
+      JSON.stringify({
+        item_id: "20261119-museai-gpt-09-001",
+        batch_id: "20261119-museai-gpt-09",
+        round: 1,
+        state: "archive",
+        destination: "archive",
+        final_tier: 0,
+        verdict: { tier: 0, flags: [] },
+        archive_ref: "gdrive:aigc/collect/001.png",
+        review_done: true,
+      }) + "\n",
+      "utf8"
+    );
+
+    const inspectCutoverProc = await runPython([
+      "-c",
+      `import json, sys; sys.path.insert(0, "agent"); import hub_client; from pathlib import Path
+l = hub_client.Ledger(Path(sys.argv[1]), "muse-main")
+b_old = l.get_batch_view("20261110-muse-main-01")
+b_new = l.get_batch_view("20261119-museai-gpt-09")
+print(json.dumps({
+  "old_001_tier": b_old.items[("20261110-muse-main-01-001", 1)]["final_tier"],
+  "old_001_ref": b_old.items[("20261110-muse-main-01-001", 1)]["archive_ref"],
+  "old_002_tier": b_old.items[("20261110-muse-main-01-002", 1)]["final_tier"],
+  "new_001_tier": b_new.items[("20261119-museai-gpt-09-001", 1)]["final_tier"],
+}))`,
+      mixedLedgerPath,
+    ]);
+    assert.equal(inspectCutoverProc.status, 0, inspectCutoverProc.stderr);
+    assert.deepEqual(JSON.parse(inspectCutoverProc.stdout), {
+      old_001_tier: 3,
+      old_001_ref: "AI_Archive/muse-main/legacy_001.png",
+      old_002_tier: 1,
+      new_001_tier: 0,
+    });
+
+    // 5C. Test `round+1` cross-batch repair re-push (`--repush-item`) + redraw candidate (`--parent-item-id`)
+    const origRepairItemId = `${batch1Id}-007`; // Was tier=3 + H (intent_tier=3) in batch 1
+    const origRedrawItemId = `${batch1Id}-005`; // Was tier=3 + R in batch 1
     await createSamplePngs([
       {
-        path: path.join(repairedDir, "art_004_hands_repaired.png"),
+        path: path.join(followupOrigDir, "007_hands_fixed.png"),
         width: 832,
         height: 1216,
-        color: [90, 180, 140],
-        prompt: null,
+        color: [90, 190, 130],
+        prompt: null, // Inherits prompt & context from round 1!
       },
       {
-        path: path.join(batch2OrigDir, "fresh_01.png"),
-        width: 1024,
-        height: 1024,
-        color: [180, 90, 140],
-        prompt: "fresh batch2 masterpiece, glowing forest",
-      },
-      {
-        path: path.join(batch2OrigDir, "fresh_02.png"),
-        width: 1344,
-        height: 768,
-        color: [70, 110, 210],
-        prompt: "fresh batch2 draft, misty river",
+        path: path.join(followupOrigDir, "005_redraw_cand.png"),
+        width: 832,
+        height: 1216,
+        color: [130, 90, 200],
+        prompt: "cinematic portrait prompt #5 (redraw candidate)",
       },
     ]);
 
-    const mountEnv = {
-      ARCHIVE_MODE: "mount",
-      ARCHIVE_LAYOUT: "ai_archive",
-      DRIVE_MOUNT_ROOT: mountRootDir,
-    };
+    // Reserve next gpt batch (`<YYYYMMDD>-museai-gpt-02`) via redraw candidate push, then append round=2 repair item
+    const redrawPushProc = await runMuseCli([
+      "push",
+      path.join(followupOrigDir, "005_redraw_cand.png"),
+      "--source",
+      "museai",
+      "--line",
+      "gpt",
+      "--parent-item-id",
+      origRedrawItemId,
+    ]);
+    assert.equal(redrawPushProc.status, 0, redrawPushProc.stderr);
+    const followupBatchId = JSON.parse(redrawPushProc.stdout).batch_id;
+    assert.match(followupBatchId, /^\d{8}-museai-gpt-02$/);
 
-    // Push fresh images + round+1 repaired item into batch 2 (chunked append to same batch_id)
-    const push2FreshProc = await runHubCli(["push", batch2OrigDir, "--batch", batch2Id], mountEnv);
-    assert.equal(push2FreshProc.status, 0, push2FreshProc.stderr);
+    const repairRepushProc = await runMuseCli([
+      "push",
+      path.join(followupOrigDir, "007_hands_fixed.png"),
+      "--batch",
+      followupBatchId,
+      "--source",
+      "museai",
+      "--line",
+      "gpt",
+      "--repush-item",
+      origRepairItemId,
+    ]);
+    assert.equal(repairRepushProc.status, 0, repairRepushProc.stderr);
+    const repairRepushOut = JSON.parse(repairRepushProc.stdout);
+    assert.equal(repairRepushOut.pushed_count, 2);
+    assert.deepEqual(repairRepushOut.accepted, [origRepairItemId]);
 
-    const push2RepairProc = await runHubCli(
-      [
-        "push",
-        path.join(repairedDir, "art_004_hands_repaired.png"),
-        "--batch",
-        batch2Id,
-        "--repush-item",
-        origRepairItemId,
-      ],
-      mountEnv
-    );
-    assert.equal(push2RepairProc.status, 0, push2RepairProc.stderr);
-    const push2RepairOut = JSON.parse(push2RepairProc.stdout);
-    assert.equal(push2RepairOut.pushed_count, 3);
-    assert.deepEqual(push2RepairOut.accepted, [origRepairItemId]);
-
-    // Verify batch 2 contains original item_id `20261113-muse-main-01-004` at `round = 2`!
-    const detail2Res = await fetch(`${srv.baseUrl}/api/review/batches/${batch2Id}`, {
+    const followupDetailRes = await fetch(`${srv.baseUrl}/api/review/batches/${followupBatchId}`, {
       headers: { "Cf-Access-Jwt-Assertion": validJwt },
     });
-    assert.equal(detail2Res.status, 200);
-    const detail2Json = await detail2Res.json();
-    const repushedItemView = detail2Json.items.find((it) => it.item_id === origRepairItemId);
-    assert.ok(repushedItemView, "Repushed item must keep its original item_id in batch 2");
-    assert.equal(repushedItemView.round, 2);
-    assert.equal(repushedItemView.width, 832);
-    assert.equal(repushedItemView.height, 1216);
+    assert.equal(followupDetailRes.status, 200);
+    const followupDetail = await followupDetailRes.json();
+    const repushedView = followupDetail.items.find((it) => it.item_id === origRepairItemId);
+    const redrawCandView = followupDetail.items.find((it) => it.item_id === `${followupBatchId}-001`);
+    assert.ok(repushedView, "Repushed repair item must retain original item_id");
+    assert.equal(repushedView.round, 2);
+    assert.ok(redrawCandView, "Redraw candidate must get new item_id");
+    assert.equal(redrawCandView.round, 1);
+    assert.equal(redrawCandView.parent_item_id, origRedrawItemId);
 
-    // Reviewer approves repaired round=2 item (tier=1) & fresh_01 (tier=2), leaves fresh_02 discarded
-    const approveRepairedRes = await fetch(
-      `${srv.baseUrl}/api/review/batches/${batch2Id}/items/${origRepairItemId}/2`,
-      {
-        method: "PATCH",
-        headers: {
-          "Cf-Access-Jwt-Assertion": validJwt,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ tier: 1, flags: [], note: "手指已修好，按原定1档入库" }),
-      }
-    );
-    assert.equal(approveRepairedRes.status, 200);
-
-    const approveFresh1Res = await fetch(
-      `${srv.baseUrl}/api/review/batches/${batch2Id}/items/${batch2Id}-001/1`,
-      {
-        method: "PATCH",
-        headers: {
-          "Cf-Access-Jwt-Assertion": validJwt,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ tier: 2, flags: [] }),
-      }
-    );
-    assert.equal(approveFresh1Res.status, 200);
-
-    const doneBatch2Res = await fetch(`${srv.baseUrl}/api/review/batches/${batch2Id}/done`, {
-      method: "POST",
-      headers: {
-        "Cf-Access-Jwt-Assertion": validJwt,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ review_done: true }),
-    });
-    assert.equal(doneBatch2Res.status, 200);
-
-    // Pull batch 2 verdicts first in connector mode, then preview ARCHIVE_LAYOUT=aigc_tier target routing
-    const pull2ConnectorProc = await runHubCli(["pull", "--batch", batch2Id], {
-      ARCHIVE_MODE: "connector",
-    });
-    assert.equal(pull2ConnectorProc.status, 0, pull2ConnectorProc.stderr);
-
-    const tierPlanProc = await runHubCli(["archive-plan", "--batch", batch2Id], {
-      ARCHIVE_MODE: "connector",
-      ARCHIVE_LAYOUT: "aigc_tier",
-    });
-    assert.equal(tierPlanProc.status, 0, tierPlanProc.stderr);
-    const tierPlanJson = JSON.parse(tierPlanProc.stdout);
-    const tier1Entry = tierPlanJson.items.find((it) => it.item_id === origRepairItemId);
-    const tier2Entry = tierPlanJson.items.find((it) => it.item_id === `${batch2Id}-001`);
-    assert.equal(
-      tier1Entry.target_drive_path,
-      "aigc/成图收录/20261113/1-神图/art_004_hands_repaired.png"
-    );
-    assert.equal(tier2Entry.target_drive_path, "aigc/成图收录/20261113/2-心动/fresh_01.png");
-
-    // Execute full automatic mount archive + ack + ledger backup!
-    const mountExecProc = await runHubCli(
-      ["archive-plan", "--batch", batch2Id, "--execute"],
-      mountEnv
-    );
-    assert.equal(mountExecProc.status, 0, `mount execute failed: ${mountExecProc.stderr}`);
-    const mountExecJson = JSON.parse(mountExecProc.stdout);
-    assert.equal(mountExecJson.executed, true);
-    assert.equal(mountExecJson.ack.ok, true);
-
-    // Verify simulated Google Drive mount files: originals + paired .txt prompts + ledger backup!
-    const mountBatch2Dir = path.join(mountRootDir, "AI_Archive", AGENT_ID, batch2Id);
-    assert.ok(fs.existsSync(path.join(mountBatch2Dir, "art_004_hands_repaired.png")));
-    assert.equal(
-      fs.readFileSync(path.join(mountBatch2Dir, "art_004_hands_repaired.txt"), "utf8"),
-      "masterpiece prompt #4, cinematic lighting"
-    );
-    assert.ok(fs.existsSync(path.join(mountBatch2Dir, "fresh_01.png")));
-    assert.equal(
-      fs.readFileSync(path.join(mountBatch2Dir, "fresh_01.txt"), "utf8"),
-      "fresh batch2 masterpiece, glowing forest"
-    );
-
-    const mountLedgerBackup = path.join(mountRootDir, "AI_Archive", `ledger-${AGENT_ID}.jsonl`);
-    assert.ok(fs.existsSync(mountLedgerBackup), "Ledger backup must exist at mount archive root");
-    const backedUpRecords = readJsonl(mountLedgerBackup);
-    assert.ok(
-      backedUpRecords.some(
-        (r) => r.item_id === origRepairItemId && r.round === 1 && r.state === "repair" && r.verdict?.tier === 1
-      ),
-      "Round 1 repair history must remain intact in backed-up ledger"
-    );
-    assert.ok(
-      backedUpRecords.some(
-        (r) =>
-          r.item_id === origRepairItemId &&
-          r.round === 2 &&
-          r.state === "archived" &&
-          r.drive_path === `AI_Archive/${AGENT_ID}/${batch2Id}/art_004_hands_repaired.png`
-      ),
-      "Round 2 archived drive_path must be recorded in backed-up ledger"
-    );
-    assert.equal(
-      backedUpRecords.filter((r) => r.state === "batch_acked").length,
-      2,
-      "Both batch 1 and batch 2 must be recorded as batch_acked"
-    );
-
-    // Verify batch 2 R2 objects and D1 rows are physically purged
-    assert.equal(harness.r2.keys().length, 0);
-    const postAckBatch2Res = await fetch(`${srv.baseUrl}/api/review/batches/${batch2Id}`, {
-      headers: { "Cf-Access-Jwt-Assertion": validJwt },
-    });
-    assert.equal(postAckBatch2Res.status, 404);
-
-    console.log("\n[E2E] ALL 5 SPEC §11 ACCEPTANCE CRITERIA & RULES 1–6 PASSED 100%!");
+    console.log("\n[E2E] ALL REVIEW OUTPOST V4 CROSS-STACK ACCEPTANCE TESTS PASSED 100%!");
   } finally {
     await srv.close();
     harness.db.close();

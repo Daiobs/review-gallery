@@ -1,12 +1,12 @@
 name = "review-outpost"
 main = "src/index.ts"
 compatibility_date = "2025-03-01"
-workers_dev = false
+workers_dev = true
 preview_urls = false
 assets = { directory = "./public", binding = "ASSETS", run_worker_first = true }
 
-# Custom domain route (workers_dev = false disables *.workers.dev; bind your custom domain
-# in Cloudflare Dashboard -> Worker -> Settings -> Domains & Routes, or uncomment below locally):
+# Optional custom domain route (bind in Cloudflare Dashboard -> Worker -> Settings -> Domains & Routes,
+# or uncomment below; *.workers.dev is also supported when protected by Cloudflare Access):
 # routes = [
 #   { pattern = "review.<YOUR_DOMAIN>", custom_domain = true }
 # ]
@@ -21,7 +21,7 @@ bucket_name = "review-outpost-previews"
 [[d1_databases]]
 binding = "DB"
 database_name = "review-outpost-db"
-database_id = "<D1_DATABASE_ID>"
+database_id = "8f518dde-04f0-4253-aa5f-aedc81a18f3f"
 migrations_dir = "migrations"
 
 [vars]

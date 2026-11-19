@@ -24,8 +24,18 @@ import type {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const REPO_ROOT = path.resolve(__dirname, "../..");
-export const MIGRATION_SQL_PATH = path.join(REPO_ROOT, "migrations", "0001_init.sql");
+export const MIGRATIONS_DIR = path.join(REPO_ROOT, "migrations");
+export const MIGRATION_SQL_PATH = path.join(MIGRATIONS_DIR, "0001_init.sql");
+export const MIGRATION_0002_SQL_PATH = path.join(MIGRATIONS_DIR, "0002_v4_upgrade.sql");
 export const WORKER_SANDBOX_DIR = path.join(REPO_ROOT, ".test-sandboxes", "worker");
+
+export function listMigrationSqlPaths(): string[] {
+  const entries = fs
+    .readdirSync(MIGRATIONS_DIR)
+    .filter((name) => name.endsWith(".sql"))
+    .sort((a, b) => a.localeCompare(b));
+  return entries.map((name) => path.join(MIGRATIONS_DIR, name));
+}
 
 function toSqlValue(val: unknown): SQLInputValue {
   if (val === undefined || val === null) {
@@ -109,7 +119,11 @@ class SqliteD1PreparedStatement implements D1PreparedStatement {
   executeSync(): D1Result<Record<string, unknown>> {
     const trimmed = this.sql.trim().toUpperCase();
     const stmt = this.db.prepare(this.sql);
-    if (trimmed.startsWith("SELECT") || trimmed.startsWith("PRAGMA") || trimmed.includes("RETURNING")) {
+    if (
+      trimmed.startsWith("SELECT") ||
+      trimmed.startsWith("PRAGMA") ||
+      trimmed.includes("RETURNING")
+    ) {
       const rows = stmt.all(...this.boundValues) as Array<Record<string, unknown>>;
       return {
         results: rows.map((r) => ({ ...r })),
@@ -138,8 +152,10 @@ export class SqliteD1Database implements D1Database {
     }
     this.sqlite = new DatabaseSync(sqlitePath);
     if (runMigrations) {
-      const migrationSql = fs.readFileSync(MIGRATION_SQL_PATH, "utf8");
-      this.sqlite.exec(migrationSql);
+      for (const migrationFile of listMigrationSqlPaths()) {
+        const sql = fs.readFileSync(migrationFile, "utf8");
+        this.sqlite.exec(sql);
+      }
     }
   }
 
@@ -204,7 +220,6 @@ async function normalizeToBytes(
   if (value instanceof Blob) {
     return new Uint8Array(await value.arrayBuffer());
   }
-  // ReadableStream
   const reader = value.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;

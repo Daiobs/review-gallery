@@ -1,16 +1,54 @@
 /**
  * 审图哨所 v4 (Review Outpost v4) — Reviewer Studio Frontend
- * Pure ES Module, zero external CDN dependencies, strict Rule 2 / 3 / 5 compliance.
+ * Pure ES Module, zero external CDN dependencies.
+ * Implements 4-star scale (tier = 3/2/1/0 <-> keys 1/2/3/4), orthogonal destination + redraw,
+ * dynamic source × line channel bar, batch_type vocabulary switching, and lineage badges.
  */
 
 export const FLAG_ORDER = ["H", "F", "O", "R"];
 const REPAIR_FLAGS = new Set(["H", "F", "O"]);
 const VALID_FLAGS = new Set(FLAG_ORDER);
 
-export const TIER_META = {
-  1: { label: "1 神图", short: "神图", cls: "badge-tier-1" },
-  2: { label: "2 心动", short: "心动", cls: "badge-tier-2" },
-  3: { label: "3 高品质", short: "高品质", cls: "badge-tier-3" },
+export const STAR_SYMBOLS = {
+  3: "★★★",
+  2: "★★",
+  1: "★",
+  0: "☆",
+};
+
+export const KEY_TO_TIER = {
+  "1": 3,
+  "2": 2,
+  "3": 1,
+  "4": 0,
+};
+
+export const TIER_TO_KEY = {
+  3: "1",
+  2: "2",
+  1: "3",
+  0: "4",
+};
+
+export const TIER_VOCABULARY = {
+  artwork: {
+    3: "神图",
+    2: "心动",
+    1: "高品质",
+    0: "收藏",
+  },
+  anchor: {
+    3: "核心锚",
+    2: "优质锚",
+    1: "达标锚",
+    0: "留样",
+  },
+};
+
+export const BATCH_TYPE_LABELS = {
+  artwork: "成图",
+  face: "脸模",
+  outfit: "服装",
 };
 
 export const FLAG_META = {
@@ -21,6 +59,51 @@ export const FLAG_META = {
 };
 
 const VIEW_MODE_STORAGE_KEY = "review_outpost_view_mode";
+const ACTIVE_CHANNEL_STORAGE_KEY = "review_outpost_active_channel";
+
+/**
+ * Explicit check for valid v4 star tier (0, 1, 2, 3).
+ * Strict guard: tier = 0 is a valid tier and MUST NEVER be treated as falsy!
+ * @param {unknown} tier
+ * @returns {tier is 0 | 1 | 2 | 3}
+ */
+export function isValidTier(tier) {
+  return tier === 0 || tier === 1 || tier === 2 || tier === 3;
+}
+
+/**
+ * Normalize batch_type into "artwork" | "face" | "outfit".
+ * @param {unknown} raw
+ * @returns {"artwork" | "face" | "outfit"}
+ */
+export function normalizeBatchType(raw) {
+  if (raw === "face" || raw === "脸模") return "face";
+  if (raw === "outfit" || raw === "服装") return "outfit";
+  return "artwork";
+}
+
+/**
+ * Get short tier name for a given tier (3/2/1/0) and batchType.
+ * @param {0|1|2|3} tier
+ * @param {string} [batchType]
+ * @returns {string}
+ */
+export function getTierShortName(tier, batchType = "artwork") {
+  const btype = normalizeBatchType(batchType);
+  const dict = btype === "face" || btype === "outfit" ? TIER_VOCABULARY.anchor : TIER_VOCABULARY.artwork;
+  return dict[tier] ?? "";
+}
+
+/**
+ * Get full star + name tier label (e.g. "★★★ 神图" or "☆ 留样").
+ * @param {0|1|2|3} tier
+ * @param {string} [batchType]
+ * @returns {string}
+ */
+export function getTierLabel(tier, batchType = "artwork") {
+  if (!isValidTier(tier)) return "";
+  return `${STAR_SYMBOLS[tier]} ${getTierShortName(tier, batchType)}`;
+}
 
 /**
  * Normalize flags to canonical order ["H", "F", "O", "R"] without duplicates.
@@ -34,57 +117,74 @@ export function normalizeFlags(flags) {
 }
 
 /**
- * Rule 3: Strict mutually-exclusive bucket priority (identical to src/buckets.ts & hub_client.py):
- * 1) flags intersects H / F / O -> "repair" (preserving tier in D1/ledger)
- * 2) else flags contains R      -> "redraw"
- * 3) else tier in {1, 2, 3}     -> "archived"
- * 4) else                       -> "discarded"
+ * Section 2.2: Orthogonal single-item disposition calculation (identical to src/buckets.ts & hub_client.py):
+ * - Mutually exclusive destination ∈ {"archive", "repair", "discard"}:
+ *   1) flags intersects H / F / O -> "repair" (tier preserved as intent_tier)
+ *   2) else tier !== null (0|1|2|3) -> "archive" (tier is final_tier)
+ *   3) else -> "discard"
+ * - Independent side-channel redraw = flags.includes("R")
  *
  * @param {number|null|undefined} tier
  * @param {string[]|undefined} flags
- * @returns {"repair"|"redraw"|"archived"|"discarded"}
+ * @returns {{ destination: "archive" | "repair" | "discard", redraw: boolean }}
  */
-export function computeBucket(tier, flags) {
-  const list = Array.isArray(flags) ? flags : [];
-  for (const f of list) {
-    if (REPAIR_FLAGS.has(f)) return "repair";
+export function computeDisposition(tier, flags) {
+  const normalized = normalizeFlags(flags);
+  let hasRepair = false;
+  for (const f of normalized) {
+    if (REPAIR_FLAGS.has(f)) {
+      hasRepair = true;
+      break;
+    }
   }
-  if (list.includes("R")) return "redraw";
-  if (tier === 1 || tier === 2 || tier === 3) return "archived";
-  return "discarded";
+
+  let destination = "discard";
+  if (hasRepair) {
+    destination = "repair";
+  } else if (isValidTier(tier)) {
+    destination = "archive";
+  }
+
+  return {
+    destination,
+    redraw: normalized.includes("R"),
+  };
 }
 
 /**
- * Determine whether an item has any reviewer input (matches backend judged_count definition).
+ * Determine whether an item has any reviewer input (tier === 0 counts as judged!).
  * @param {{ tier?: number|null, flags?: string[], note?: string }} item
  * @returns {boolean}
  */
 export function isItemJudged(item) {
-  const hasTier = item.tier === 1 || item.tier === 2 || item.tier === 3;
-  const hasFlags = Array.isArray(item.flags) && item.flags.length > 0;
+  if (!item || typeof item !== "object") return false;
+  const hasTier = isValidTier(item.tier);
+  const hasFlags = Array.isArray(item.flags) && normalizeFlags(item.flags).length > 0;
   const hasNote = typeof item.note === "string" && item.note.trim().length > 0;
   return hasTier || hasFlags || hasNote;
 }
 
 /**
- * Compute aggregate 4-bucket counts and judged_count over items.
+ * Compute aggregate counts { pushed, archive, repair, discard, redraw } and judged_count.
+ * Note: archive + repair + discard === items.length; redraw is orthogonal.
  * @param {Array<{ tier?: number|null, flags?: string[], note?: string }>} items
  * @param {number} [pushedOverride]
  */
 export function computeBatchCounts(items, pushedOverride) {
-  let archived = 0;
+  let archive = 0;
   let repair = 0;
+  let discard = 0;
   let redraw = 0;
-  let discarded = 0;
   let judged = 0;
 
   for (const item of items) {
-    const bucket = computeBucket(item.tier ?? null, item.flags ?? []);
-    if (bucket === "archived") archived += 1;
-    else if (bucket === "repair") repair += 1;
-    else if (bucket === "redraw") redraw += 1;
-    else discarded += 1;
+    const tierVal = isValidTier(item.tier) ? item.tier : null;
+    const disp = computeDisposition(tierVal, item.flags ?? []);
+    if (disp.destination === "archive") archive += 1;
+    else if (disp.destination === "repair") repair += 1;
+    else discard += 1;
 
+    if (disp.redraw) redraw += 1;
     if (isItemJudged(item)) judged += 1;
   }
 
@@ -92,32 +192,89 @@ export function computeBatchCounts(items, pushedOverride) {
     judged_count: judged,
     counts: {
       pushed: typeof pushedOverride === "number" ? pushedOverride : items.length,
-      archived,
+      archive,
       repair,
+      discard,
       redraw,
-      discarded,
     },
   };
 }
 
 /**
- * Format human-readable bucket badge label, preserving original tier note when overridden by repair/redraw.
- * @param {"archived"|"repair"|"redraw"|"discarded"} bucket
+ * Section 5.3: Format item disposition badge text accurately reflecting destination + redraw + intent_tier:
+ * - tier=3 + R (artwork)   -> "★★★ 神图 · 重抽" (face/outfit: "★★★ 核心锚 · 重抽")
+ * - tier=3 + H + R         -> "待修复(意向★★★) · H · 重抽" (without R: "待修复(意向★★★) · H")
+ * - tier=0 + H             -> "待修复(意向☆) · H"
+ * - tier=null + R          -> "仅重抽（原图不收）"
+ * - tier=null + []         -> "不收录"
+ *
  * @param {number|null|undefined} tier
+ * @param {string[]|undefined} flags
+ * @param {string} [batchType]
  * @returns {string}
  */
-export function formatBucketLabel(bucket, tier) {
-  const hasTier = tier === 1 || tier === 2 || tier === 3;
-  if (bucket === "repair") {
-    return hasTier ? `待修复 (原定${tier}档)` : "待修复";
+export function formatDispositionBadge(tier, flags, batchType = "artwork") {
+  const validTier = isValidTier(tier) ? tier : null;
+  const normalized = normalizeFlags(flags);
+  const disp = computeDisposition(validTier, normalized);
+
+  if (disp.destination === "repair") {
+    const repairParts = normalized.filter((f) => REPAIR_FLAGS.has(f));
+    const head = validTier !== null ? `待修复(意向${STAR_SYMBOLS[validTier]})` : "待修复";
+    const segments = [head];
+    if (repairParts.length > 0) {
+      segments.push(repairParts.join("/"));
+    }
+    if (disp.redraw) {
+      segments.push("重抽");
+    }
+    return segments.join(" · ");
   }
-  if (bucket === "redraw") {
-    return hasTier ? `待重抽 (原定${tier}档)` : "待重抽";
+
+  if (disp.destination === "archive" && validTier !== null) {
+    const base = getTierLabel(validTier, batchType);
+    return disp.redraw ? `${base} · 重抽` : base;
   }
-  if (bucket === "archived") {
-    return "拟归档";
+
+  if (disp.redraw) {
+    return "仅重抽（原图不收）";
   }
+
   return "不收录";
+}
+
+/**
+ * Section 5.3: Orthogonal filter matching:
+ * - "archive" -> destination === "archive" (includes tier + R!)
+ * - "repair"  -> destination === "repair"  (includes H/F/O + R!)
+ * - "discard" -> destination === "discard" (includes tier=null + R!)
+ * - "redraw"  -> redraw === true           (includes tier + R, H + R, and tier=null + R!)
+ *
+ * @param {{ tier?: number|null, flags?: string[], note?: string, destination?: string, redraw?: boolean }} item
+ * @param {string} filter
+ * @returns {boolean}
+ */
+export function itemMatchesFilter(item, filter) {
+  if (!filter || filter === "all") return true;
+  if (filter === "unjudged") return !isItemJudged(item);
+
+  const disp =
+    typeof item.destination === "string" && typeof item.redraw === "boolean"
+      ? { destination: item.destination, redraw: item.redraw }
+      : computeDisposition(isValidTier(item.tier) ? item.tier : null, item.flags ?? []);
+
+  if (filter === "redraw") return disp.redraw === true;
+  if (filter === "archive" || filter === "repair" || filter === "discard") {
+    return disp.destination === filter;
+  }
+  return true;
+}
+
+function getDispositionBadgeClass(destination, redraw) {
+  if (destination === "repair") return "disp-repair";
+  if (destination === "archive") return "disp-archive";
+  if (redraw) return "disp-redraw-only";
+  return "disp-discard";
 }
 
 /* ============================================================================
@@ -128,20 +285,22 @@ function initApp() {
   const state = {
     route: "list", // "list" | "batch"
     batches: [],
+    activeChannel: loadStoredChannel(), // "all" or channel_id
+    collapsedSources: new Set(),
     currentBatchId: null,
     batch: null,
     items: [],
     visibleIndices: [],
     activeIndex: -1, // index into state.items
     viewMode: loadStoredViewMode(), // "grid" | "masonry"
-    filter: "all", // "all" | "unjudged" | "archived" | "repair" | "redraw" | "discarded"
+    filter: "all", // "all" | "unjudged" | "archive" | "repair" | "redraw" | "discard"
     doneSubmitting: false,
 
     // Lightbox state
     lightbox: {
       open: false,
-      scale: 1, // multiplier relative to fitted stage box (1 = Fit)
-      zoomMode: "fit", // "fit" | "actual" | "custom"
+      scale: 1,
+      zoomMode: "fit",
       panX: 0,
       panY: 0,
       pointers: new Map(),
@@ -166,7 +325,6 @@ function initApp() {
     speechActive: false,
   };
 
-  // Per-item sequential PATCH chains & latest sequence numbers
   const pendingChains = new Map();
   const itemMutationSeq = new Map();
   const cardDomByIndex = new Map();
@@ -177,6 +335,8 @@ function initApp() {
     brandBlock: document.getElementById("brand-block"),
     batchHeaderMeta: document.getElementById("batch-header-meta"),
     headerBatchId: document.getElementById("header-batch-id"),
+    headerChannelBadge: document.getElementById("header-channel-badge"),
+    headerTypeBadge: document.getElementById("header-type-badge"),
     headerAgentBadge: document.getElementById("header-agent-badge"),
     headerStatusBadge: document.getElementById("header-status-badge"),
     headerProgressText: document.getElementById("header-progress-text"),
@@ -193,6 +353,7 @@ function initApp() {
 
     viewBatchList: document.getElementById("view-batch-list"),
     batchListCount: document.getElementById("batch-list-count"),
+    channelBar: document.getElementById("channel-bar"),
     batchListLoading: document.getElementById("batch-list-loading"),
     batchListEmpty: document.getElementById("batch-list-empty"),
     batchListGrid: document.getElementById("batch-list-grid"),
@@ -204,10 +365,11 @@ function initApp() {
     bucketFilterBar: document.getElementById("bucket-filter-bar"),
     fltCountAll: document.getElementById("flt-count-all"),
     fltCountUnjudged: document.getElementById("flt-count-unjudged"),
-    fltCountArchived: document.getElementById("flt-count-archived"),
+    fltCountArchive: document.getElementById("flt-count-archive"),
     fltCountRepair: document.getElementById("flt-count-repair"),
     fltCountRedraw: document.getElementById("flt-count-redraw"),
-    fltCountDiscarded: document.getElementById("flt-count-discarded"),
+    fltCountDiscard: document.getElementById("flt-count-discard"),
+    shortcutStrip: document.getElementById("shortcut-strip"),
 
     batchDetailLoading: document.getElementById("batch-detail-loading"),
     batchItemsEmpty: document.getElementById("batch-items-empty"),
@@ -226,6 +388,7 @@ function initApp() {
     lightbox: document.getElementById("lightbox"),
     lbCounter: document.getElementById("lb-counter"),
     lbRoundBadge: document.getElementById("lb-round-badge"),
+    lbLineageBadge: document.getElementById("lb-lineage-badge"),
     lbItemId: document.getElementById("lb-item-id"),
     lbDimensions: document.getElementById("lb-dimensions"),
     lbBucketBadge: document.getElementById("lb-bucket-badge"),
@@ -262,7 +425,7 @@ function initApp() {
   };
 
   /* ------------------------------------------------------------------------
-   * Utilities
+   * Storage & Formatting Utilities
    * ---------------------------------------------------------------------- */
 
   function loadStoredViewMode() {
@@ -270,7 +433,7 @@ function initApp() {
       const saved = window.localStorage.getItem(VIEW_MODE_STORAGE_KEY);
       if (saved === "masonry" || saved === "grid") return saved;
     } catch {
-      // Ignore storage access errors in restricted contexts
+      // Ignore restricted storage errors
     }
     return "grid";
   }
@@ -278,6 +441,24 @@ function initApp() {
   function saveViewMode(mode) {
     try {
       window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, mode);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  function loadStoredChannel() {
+    try {
+      const saved = window.localStorage.getItem(ACTIVE_CHANNEL_STORAGE_KEY);
+      if (saved && typeof saved === "string") return saved;
+    } catch {
+      // Ignore storage errors
+    }
+    return "all";
+  }
+
+  function saveStoredChannel(channelId) {
+    try {
+      window.localStorage.setItem(ACTIVE_CHANNEL_STORAGE_KEY, channelId);
     } catch {
       // Ignore storage errors
     }
@@ -301,12 +482,31 @@ function initApp() {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
+  function parseTierStrict(rawTier) {
+    if (rawTier === null || rawTier === undefined || rawTier === "") {
+      return null;
+    }
+    if (isValidTier(rawTier)) {
+      return rawTier;
+    }
+    if (typeof rawTier === "number" || typeof rawTier === "string") {
+      const n = Number(rawTier);
+      if (isValidTier(n)) return n;
+    }
+    return null;
+  }
+
   function normalizeItem(raw, fallbackBatchId) {
     const flags = normalizeFlags(raw.flags);
-    const tier = raw.tier === 1 || raw.tier === 2 || raw.tier === 3 ? raw.tier : null;
+    const tier = parseTierStrict(raw.tier);
     const note = typeof raw.note === "string" ? raw.note : "";
     const batchId = raw.batch_id || fallbackBatchId || "";
     const round = Number.isFinite(Number(raw.round)) && Number(raw.round) >= 1 ? Number(raw.round) : 1;
+    const parentItemId =
+      typeof raw.parent_item_id === "string" && raw.parent_item_id.trim().length > 0
+        ? raw.parent_item_id.trim()
+        : null;
+    const disp = computeDisposition(tier, flags);
     const previewUrl =
       raw.preview_url ||
       `/api/review/previews/${encodeURIComponent(batchId)}/${encodeURIComponent(raw.item_id)}/${encodeURIComponent(round)}`;
@@ -318,39 +518,70 @@ function initApp() {
       filename: raw.filename || `${raw.item_id}_r${round}.webp`,
       width: Number.isFinite(Number(raw.width)) && Number(raw.width) > 0 ? Math.round(Number(raw.width)) : null,
       height: Number.isFinite(Number(raw.height)) && Number(raw.height) > 0 ? Math.round(Number(raw.height)) : null,
+      parent_item_id: parentItemId,
       pushed_at: raw.pushed_at || null,
       tier,
       flags,
       note,
       judged_at: raw.judged_at || null,
-      bucket: computeBucket(tier, flags),
+      destination: disp.destination,
+      redraw: disp.redraw,
       preview_url: previewUrl,
     };
   }
 
+  function inferSourceFromAgent(agentId) {
+    if (agentId === "muse-main") return "museai";
+    if (agentId === "argon-mac") return "gallery";
+    return agentId || "unknown";
+  }
+
   function normalizeBatch(raw) {
+    const agentId = String(raw.agent_id || "unknown");
+    const source =
+      typeof raw.source === "string" && raw.source.trim().length > 0
+        ? raw.source.trim()
+        : inferSourceFromAgent(agentId);
+    const line =
+      typeof raw.line === "string" && raw.line.trim().length > 0 ? raw.line.trim() : null;
+    const channelId =
+      typeof raw.channel_id === "string" && raw.channel_id.trim().length > 0
+        ? raw.channel_id.trim()
+        : line
+        ? `${source}-${line}`
+        : source;
+    const batchType = normalizeBatchType(raw.batch_type);
+
     const pushedCount = Number(raw.pushed_count ?? raw.counts?.pushed ?? 0);
-    const counts = raw.counts || {
-      pushed: pushedCount,
-      archived: 0,
-      repair: 0,
-      redraw: 0,
-      discarded: pushedCount,
-    };
+    const rawCounts = raw.counts || {};
+    const archiveCount = Number(rawCounts.archive ?? rawCounts.archived ?? 0);
+    const repairCount = Number(rawCounts.repair ?? 0);
+    const discardCount = Number(
+      rawCounts.discard ??
+        rawCounts.discarded ??
+        Math.max(0, pushedCount - archiveCount - repairCount)
+    );
+    const redrawCount = Number(rawCounts.redraw ?? 0);
+
     return {
       batch_id: String(raw.batch_id),
-      agent_id: String(raw.agent_id || "unknown"),
+      agent_id: agentId,
+      source,
+      line,
+      channel_id: channelId,
+      batch_type: batchType,
       pushed_count: pushedCount,
       judged_count: Number(raw.judged_count ?? 0),
       review_done: Boolean(raw.review_done),
+      review_done_at: raw.review_done_at || null,
       created_at: raw.created_at || "",
       previews_purged_at: raw.previews_purged_at || null,
       counts: {
-        pushed: Number(counts.pushed ?? pushedCount),
-        archived: Number(counts.archived ?? 0),
-        repair: Number(counts.repair ?? 0),
-        redraw: Number(counts.redraw ?? 0),
-        discarded: Number(counts.discarded ?? 0),
+        pushed: Number(rawCounts.pushed ?? pushedCount),
+        archive: archiveCount,
+        repair: repairCount,
+        discard: discardCount,
+        redraw: redrawCount,
       },
     };
   }
@@ -425,7 +656,7 @@ function initApp() {
   }
 
   /* ------------------------------------------------------------------------
-   * View 1: Batch List
+   * View 1: Batch List + Dynamic Source × Line Channel Bar (Section 5.1)
    * ---------------------------------------------------------------------- */
 
   async function showBatchListView() {
@@ -439,7 +670,6 @@ function initApp() {
     closeLightbox();
     closeNoteModal();
 
-    // Header visibility
     el.btnBackBatches.hidden = true;
     el.brandBlock.classList.remove("in-batch");
     el.batchHeaderMeta.hidden = true;
@@ -462,6 +692,7 @@ function initApp() {
       el.batchListLoading.hidden = true;
 
       if (!ok || !data || !Array.isArray(data.batches)) {
+        el.channelBar.hidden = true;
         showToast(
           status === 401 || status === 403
             ? "未通过 Cloudflare Access 登录鉴权，请刷新重新认证"
@@ -473,29 +704,218 @@ function initApp() {
       }
 
       state.batches = data.batches.map(normalizeBatch);
-      el.batchListCount.textContent =
-        state.batches.length > 0 ? `共 ${state.batches.length} 个云端批次` : "";
-
-      if (state.batches.length === 0) {
-        el.batchListEmpty.hidden = false;
-        return;
-      }
-
-      const frag = document.createDocumentFragment();
-      for (const batch of state.batches) {
-        frag.appendChild(createBatchCardElement(batch));
-      }
-      el.batchListGrid.appendChild(frag);
+      reconcileChannelAndRenderList();
     } catch {
       el.batchListLoading.hidden = true;
+      el.channelBar.hidden = true;
       el.batchListEmpty.hidden = false;
       showToast("网络连接异常，无法获取批次列表", "error");
     }
   }
 
+  function aggregateChannels(batches) {
+    const map = new Map();
+    for (const b of batches) {
+      let entry = map.get(b.channel_id);
+      if (!entry) {
+        entry = {
+          channel_id: b.channel_id,
+          source: b.source,
+          line: b.line,
+          total_batches: 0,
+          pending_batches: 0,
+        };
+        map.set(b.channel_id, entry);
+      }
+      entry.total_batches += 1;
+      if (!b.review_done) {
+        entry.pending_batches += 1;
+      }
+    }
+    return [...map.values()].sort((a, b) => {
+      if (a.source !== b.source) return a.source.localeCompare(b.source);
+      return a.channel_id.localeCompare(b.channel_id);
+    });
+  }
+
+  function reconcileChannelAndRenderList() {
+    const channels = aggregateChannels(state.batches);
+    const channelIds = new Set(channels.map((c) => c.channel_id));
+
+    // Smooth fallback: if saved channel_id currently has 0 batches, revert to "all"
+    if (state.activeChannel !== "all" && !channelIds.has(state.activeChannel)) {
+      state.activeChannel = "all";
+      saveStoredChannel("all");
+    }
+
+    renderChannelBar(channels);
+    renderFilteredBatchCards();
+  }
+
+  function setActiveChannel(channelId) {
+    state.activeChannel = channelId;
+    saveStoredChannel(channelId);
+    const channels = aggregateChannels(state.batches);
+    // Ensure parent source group is unfolded when selecting a channel inside it
+    const picked = channels.find((c) => c.channel_id === channelId);
+    if (picked) {
+      state.collapsedSources.delete(picked.source);
+    }
+    renderChannelBar(channels);
+    renderFilteredBatchCards();
+  }
+
+  function createChannelTabButton(label, channelId, pendingCount, totalCount, isCode = true) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `channel-tab${state.activeChannel === channelId ? " active" : ""}`;
+    btn.dataset.channel = channelId;
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected", state.activeChannel === channelId ? "true" : "false");
+    btn.title = `未审完 ${pendingCount} 批 / 共 ${totalCount} 批`;
+
+    const txt = document.createElement("span");
+    if (isCode) txt.className = "channel-tab-code";
+    txt.textContent = label;
+
+    const badge = document.createElement("span");
+    badge.className = `ch-badge${pendingCount === 0 ? " is-zero" : ""}`;
+    badge.textContent = String(pendingCount);
+
+    btn.append(txt, badge);
+    btn.addEventListener("click", () => setActiveChannel(channelId));
+    return btn;
+  }
+
+  function renderChannelBar(channels) {
+    el.channelBar.innerHTML = "";
+    if (state.batches.length === 0) {
+      el.channelBar.hidden = true;
+      return;
+    }
+
+    el.channelBar.hidden = false;
+    const totalPending = state.batches.reduce((acc, b) => acc + (b.review_done ? 0 : 1), 0);
+    const frag = document.createDocumentFragment();
+
+    // "全部" tab
+    frag.appendChild(
+      createChannelTabButton("全部", "all", totalPending, state.batches.length, false)
+    );
+
+    if (channels.length <= 5) {
+      // Flat channel bar
+      for (const ch of channels) {
+        frag.appendChild(
+          createChannelTabButton(
+            ch.channel_id,
+            ch.channel_id,
+            ch.pending_batches,
+            ch.total_batches,
+            true
+          )
+        );
+      }
+    } else {
+      // Grouped by primary `source` with fold/unfold toggles when > 5 channels
+      const bySource = new Map();
+      for (const ch of channels) {
+        const list = bySource.get(ch.source) || [];
+        list.push(ch);
+        bySource.set(ch.source, list);
+      }
+
+      for (const [source, groupChannels] of bySource.entries()) {
+        const hasActiveChild = groupChannels.some((c) => c.channel_id === state.activeChannel);
+        if (hasActiveChild) {
+          state.collapsedSources.delete(source);
+        }
+        const isCollapsed = state.collapsedSources.has(source);
+        const sourcePending = groupChannels.reduce((acc, c) => acc + c.pending_batches, 0);
+
+        const groupWrap = document.createElement("div");
+        groupWrap.className = "channel-source-group";
+        groupWrap.dataset.source = source;
+
+        const toggleBtn = document.createElement("button");
+        toggleBtn.type = "button";
+        toggleBtn.className = "channel-group-toggle";
+        toggleBtn.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+        toggleBtn.title = `展开/折叠 ${source} 工作台通道（未审完 ${sourcePending} 批）`;
+        toggleBtn.textContent = `${isCollapsed ? "▸" : "▾"} ${source}`;
+
+        const grpBadge = document.createElement("span");
+        grpBadge.className = `ch-badge${sourcePending === 0 ? " is-zero" : ""}`;
+        grpBadge.textContent = String(sourcePending);
+        toggleBtn.appendChild(grpBadge);
+
+        toggleBtn.addEventListener("click", () => {
+          if (state.collapsedSources.has(source)) {
+            state.collapsedSources.delete(source);
+          } else {
+            state.collapsedSources.add(source);
+          }
+          renderChannelBar(channels);
+        });
+
+        groupWrap.appendChild(toggleBtn);
+
+        if (!isCollapsed) {
+          const childrenWrap = document.createElement("div");
+          childrenWrap.className = "channel-group-children";
+          for (const ch of groupChannels) {
+            childrenWrap.appendChild(
+              createChannelTabButton(
+                ch.channel_id,
+                ch.channel_id,
+                ch.pending_batches,
+                ch.total_batches,
+                true
+              )
+            );
+          }
+          groupWrap.appendChild(childrenWrap);
+        }
+
+        frag.appendChild(groupWrap);
+      }
+    }
+
+    el.channelBar.appendChild(frag);
+  }
+
+  function renderFilteredBatchCards() {
+    el.batchListGrid.innerHTML = "";
+
+    const filtered =
+      state.activeChannel === "all"
+        ? state.batches
+        : state.batches.filter((b) => b.channel_id === state.activeChannel);
+
+    if (state.batches.length === 0) {
+      el.batchListCount.textContent = "";
+      el.batchListEmpty.hidden = false;
+      return;
+    }
+
+    el.batchListEmpty.hidden = filtered.length > 0;
+    el.batchListCount.textContent =
+      state.activeChannel === "all"
+        ? `共 ${state.batches.length} 个云端批次`
+        : `通道 ${state.activeChannel}：${filtered.length} / 共 ${state.batches.length} 批`;
+
+    const frag = document.createDocumentFragment();
+    for (const batch of filtered) {
+      frag.appendChild(createBatchCardElement(batch));
+    }
+    el.batchListGrid.appendChild(frag);
+  }
+
   function createBatchCardElement(batch) {
     const card = document.createElement("article");
     card.className = "batch-card";
+    card.dataset.channelId = batch.channel_id;
+    card.dataset.batchType = batch.batch_type;
     card.tabIndex = 0;
     card.setAttribute("role", "button");
     card.setAttribute("aria-label", `进入批次 ${batch.batch_id}`);
@@ -515,12 +935,24 @@ function initApp() {
 
     const meta = document.createElement("div");
     meta.className = "batch-card-meta";
+
+    const channelPill = document.createElement("span");
+    channelPill.className = "pill pill-channel";
+    channelPill.textContent = batch.channel_id;
+
+    const typePill = document.createElement("span");
+    typePill.className = "pill pill-type";
+    typePill.dataset.btype = batch.batch_type;
+    typePill.textContent = BATCH_TYPE_LABELS[batch.batch_type] || "成图";
+
     const agentPill = document.createElement("span");
     agentPill.className = "pill pill-agent";
     agentPill.textContent = batch.agent_id;
+
     const timeSpan = document.createElement("span");
     timeSpan.textContent = formatDateTime(batch.created_at);
-    meta.append(agentPill, timeSpan);
+
+    meta.append(channelPill, typePill, agentPill, timeSpan);
     if (batch.previews_purged_at) {
       const purgedSpan = document.createElement("span");
       purgedSpan.className = "pill";
@@ -556,10 +988,10 @@ function initApp() {
     const countsGrid = document.createElement("div");
     countsGrid.className = "batch-counts-grid";
     const chips = [
-      { cls: "c-archived", num: batch.counts.archived, lbl: "归档" },
-      { cls: "c-repair", num: batch.counts.repair, lbl: "修复" },
-      { cls: "c-redraw", num: batch.counts.redraw, lbl: "重抽" },
-      { cls: "c-discarded", num: batch.counts.discarded, lbl: "不收录" },
+      { cls: "c-archive", num: batch.counts.archive, lbl: "拟归档" },
+      { cls: "c-repair", num: batch.counts.repair, lbl: "待修复" },
+      { cls: "c-redraw", num: batch.counts.redraw, lbl: "待重抽" },
+      { cls: "c-discard", num: batch.counts.discard, lbl: "不收录" },
     ];
     for (const c of chips) {
       const chip = document.createElement("div");
@@ -638,9 +1070,8 @@ function initApp() {
         ? data.items.map((it) => normalizeItem(it, state.batch.batch_id))
         : [];
 
-      // Ensure local bucket & counts are strictly synchronized
       recomputeLocalBatchStats();
-
+      syncVocabularyLabels(state.batch.batch_type);
       renderBatchHeaderAndBanners();
       buildGalleryDom();
       applyFilterAndSelection(state.items.length > 0 ? 0 : -1);
@@ -657,11 +1088,35 @@ function initApp() {
     state.batch.counts = computed.counts;
   }
 
+  /**
+   * Sync 4-star vocabulary across dock, lightbox footer, and shortcut strip based on batch_type.
+   */
+  function syncVocabularyLabels(batchType) {
+    const btype = normalizeBatchType(batchType);
+    for (const node of document.querySelectorAll("[data-tier-name]")) {
+      const t = parseTierStrict(node.getAttribute("data-tier-name"));
+      if (t !== null) {
+        node.textContent = getTierShortName(t, btype);
+      }
+    }
+    if (el.shortcutStrip) {
+      for (const node of el.shortcutStrip.querySelectorAll("[data-vocab-tier]")) {
+        const t = parseTierStrict(node.getAttribute("data-vocab-tier"));
+        if (t !== null) {
+          node.textContent = getTierLabel(t, btype);
+        }
+      }
+    }
+  }
+
   function renderBatchHeaderAndBanners() {
     const batch = state.batch;
     if (!batch) return;
 
     el.headerBatchId.textContent = batch.batch_id;
+    el.headerChannelBadge.textContent = batch.channel_id;
+    el.headerTypeBadge.dataset.btype = batch.batch_type;
+    el.headerTypeBadge.textContent = BATCH_TYPE_LABELS[batch.batch_type] || "成图";
     el.headerAgentBadge.textContent = batch.agent_id;
 
     el.headerStatusBadge.className = `pill ${batch.review_done ? "pill-done" : "pill-reviewing"}`;
@@ -675,7 +1130,7 @@ function initApp() {
     el.headerProgressFill.style.width = `${pct}%`;
 
     const c = batch.counts;
-    el.headerBucketSummary.textContent = `归档 ${c.archived} · 修复 ${c.repair} · 重抽 ${c.redraw} · 淘汰 ${c.discarded}`;
+    el.headerBucketSummary.textContent = `拟归档 ${c.archive} · 待修复 ${c.repair} · 待重抽 ${c.redraw} · 不收录 ${c.discard}`;
 
     // Done / Revoke buttons + Locked banner
     el.lockedBanner.hidden = !batch.review_done;
@@ -695,13 +1150,24 @@ function initApp() {
     }
     el.fltCountAll.textContent = String(state.items.length);
     el.fltCountUnjudged.textContent = String(unjudgedCount);
-    el.fltCountArchived.textContent = String(c.archived);
+    el.fltCountArchive.textContent = String(c.archive);
     el.fltCountRepair.textContent = String(c.repair);
     el.fltCountRedraw.textContent = String(c.redraw);
-    el.fltCountDiscarded.textContent = String(c.discarded);
+    el.fltCountDiscard.textContent = String(c.discard);
 
     for (const btn of el.bucketFilterBar.querySelectorAll(".filter-pill")) {
       btn.classList.toggle("active", btn.dataset.filter === state.filter);
+    }
+
+    // Sync card hover bar lock state
+    for (const card of cardDomByIndex.values()) {
+      const hoverBar = card.querySelector(".card-hover-bar");
+      if (hoverBar) {
+        hoverBar.classList.toggle("is-locked", batch.review_done);
+        for (const qBtn of hoverBar.querySelectorAll("button")) {
+          qBtn.disabled = batch.review_done;
+        }
+      }
     }
 
     el.actionDock.hidden = state.items.length === 0;
@@ -743,12 +1209,15 @@ function initApp() {
   }
 
   function createGalleryCard(item, index) {
+    const batchType = state.batch?.batch_type || "artwork";
+    const locked = Boolean(state.batch?.review_done);
+
     const card = document.createElement("article");
     card.className = "gallery-card";
     card.dataset.index = String(index);
     card.dataset.itemId = item.item_id;
 
-    // Rule 2: Pre-reserve exact aspect-ratio from D1 width/height (fallback 1 / 1) BEFORE WebP loads!
+    // Pre-reserve exact aspect-ratio from D1 width/height (fallback 1 / 1) BEFORE WebP loads
     const w = item.width && item.width > 0 ? item.width : 1;
     const h = item.height && item.height > 0 ? item.height : 1;
     const orient = h > w ? "portrait" : "landscape";
@@ -810,7 +1279,40 @@ function initApp() {
     });
 
     topOverlay.append(seqPill, zoomBtn);
-    stage.append(aspectBox, topOverlay);
+
+    // Card Hover Quick 4-Star Tier Bar (Section 5.2)
+    const hoverBar = document.createElement("div");
+    hoverBar.className = `card-hover-bar${locked ? " is-locked" : ""}`;
+    for (const tierVal of [3, 2, 1, 0]) {
+      const qBtn = document.createElement("button");
+      qBtn.type = "button";
+      qBtn.className = `card-tier-quick ctq-${tierVal}`;
+      qBtn.dataset.cardTier = String(tierVal);
+      qBtn.disabled = locked;
+      qBtn.title = `快捷键 ${TIER_TO_KEY[tierVal]}：${getTierLabel(tierVal, batchType)}`;
+
+      const kSpan = document.createElement("span");
+      kSpan.className = "key-corner";
+      kSpan.textContent = TIER_TO_KEY[tierVal];
+
+      const sSpan = document.createElement("span");
+      sSpan.className = "ctq-stars";
+      sSpan.textContent = STAR_SYMBOLS[tierVal];
+
+      const nSpan = document.createElement("span");
+      nSpan.className = "ctq-name";
+      nSpan.textContent = getTierShortName(tierVal, batchType);
+
+      qBtn.append(kSpan, sSpan, nSpan);
+      qBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        selectItem(index, false);
+        toggleTierOnIndex(index, tierVal);
+      });
+      hoverBar.appendChild(qBtn);
+    }
+
+    stage.append(aspectBox, topOverlay, hoverBar);
 
     // Card footer body
     const body = document.createElement("div");
@@ -831,24 +1333,35 @@ function initApp() {
     const badgesRow = document.createElement("div");
     badgesRow.className = "card-badges";
 
+    // Lineage badge row (Section 5.4: parent_item_id)
+    const lineageRow = document.createElement("div");
+    lineageRow.className = "card-lineage-row";
+    lineageRow.hidden = !item.parent_item_id;
+    if (item.parent_item_id) {
+      const linBadge = document.createElement("span");
+      linBadge.className = "badge badge-lineage";
+      linBadge.title = `源自 ${item.parent_item_id}`;
+      linBadge.textContent = `源自 ${item.parent_item_id}`;
+      lineageRow.appendChild(linBadge);
+    }
+
     const noteSnippet = document.createElement("p");
     noteSnippet.className = "card-note-snippet";
     noteSnippet.hidden = true;
 
-    body.append(metaRow, badgesRow, noteSnippet);
+    body.append(metaRow, badgesRow, lineageRow, noteSnippet);
     card.append(stage, body);
 
-    // Interaction: click selects card; tapping an already-selected card on touch or double-clicking opens Lightbox
     card.addEventListener("click", (e) => {
       const wasActive = state.activeIndex === index;
       selectItem(index, false);
-      if (wasActive && e.target.closest(".card-stage")) {
-        // Second click/tap on already-active artwork stage opens Lightbox effortlessly on mobile & desktop
+      if (wasActive && e.target.closest(".card-stage") && !e.target.closest(".card-hover-bar")) {
         openLightbox(index);
       }
     });
 
     card.addEventListener("dblclick", (e) => {
+      if (e.target.closest(".card-hover-bar")) return;
       e.preventDefault();
       selectItem(index, false);
       openLightbox(index);
@@ -859,6 +1372,7 @@ function initApp() {
   }
 
   function renderBadgesInto(container, item) {
+    const batchType = state.batch?.batch_type || "artwork";
     container.innerHTML = "";
     let anyBadge = false;
 
@@ -870,10 +1384,11 @@ function initApp() {
       anyBadge = true;
     }
 
-    if (item.tier && TIER_META[item.tier]) {
+    // CRITICAL anti-zero-swallow check: use isValidTier(item.tier), NEVER truthiness!
+    if (isValidTier(item.tier)) {
       const tb = document.createElement("span");
-      tb.className = `badge ${TIER_META[item.tier].cls}`;
-      tb.textContent = TIER_META[item.tier].label;
+      tb.className = `badge badge-tier-${item.tier}`;
+      tb.textContent = getTierLabel(item.tier, batchType);
       container.appendChild(tb);
       anyBadge = true;
     }
@@ -898,15 +1413,45 @@ function initApp() {
 
   function patchCardVerdictDom(card, item) {
     if (!card) return;
+    const batchType = state.batch?.batch_type || "artwork";
+
     const bucketBadge = card.querySelector(".bucket-badge");
     if (bucketBadge) {
-      bucketBadge.className = `bucket-badge bucket-${item.bucket}`;
-      bucketBadge.textContent = formatBucketLabel(item.bucket, item.tier);
+      const dispCls = getDispositionBadgeClass(item.destination, item.redraw);
+      bucketBadge.className = `bucket-badge ${dispCls}`;
+      bucketBadge.textContent = formatDispositionBadge(item.tier, item.flags, batchType);
     }
 
     const badgesRow = card.querySelector(".card-badges");
     if (badgesRow) {
       renderBadgesInto(badgesRow, item);
+    }
+
+    // Sync hover bar selected tier state (strictly preserving tier === 0!)
+    for (const qBtn of card.querySelectorAll("[data-card-tier]")) {
+      const btnTier = parseTierStrict(qBtn.getAttribute("data-card-tier"));
+      qBtn.classList.toggle("is-selected", btnTier !== null && item.tier === btnTier);
+      const nSpan = qBtn.querySelector(".ctq-name");
+      if (nSpan && btnTier !== null) {
+        nSpan.textContent = getTierShortName(btnTier, batchType);
+      }
+    }
+
+    const lineageRow = card.querySelector(".card-lineage-row");
+    if (lineageRow) {
+      if (item.parent_item_id) {
+        lineageRow.hidden = false;
+        let linBadge = lineageRow.querySelector(".badge-lineage");
+        if (!linBadge) {
+          linBadge = document.createElement("span");
+          linBadge.className = "badge badge-lineage";
+          lineageRow.appendChild(linBadge);
+        }
+        linBadge.title = `源自 ${item.parent_item_id}`;
+        linBadge.textContent = `源自 ${item.parent_item_id}`;
+      } else {
+        lineageRow.hidden = true;
+      }
     }
 
     const noteSnippet = card.querySelector(".card-note-snippet");
@@ -948,12 +1493,6 @@ function initApp() {
         card.style.gridRowEnd = `span ${Math.ceil(rectH + gapPx)}`;
       }
     }
-  }
-
-  function itemMatchesFilter(item, filter) {
-    if (filter === "all") return true;
-    if (filter === "unjudged") return !isItemJudged(item);
-    return item.bucket === filter;
   }
 
   function applyFilterAndSelection(preferredIndex, keepActiveVisible = false) {
@@ -1020,8 +1559,11 @@ function initApp() {
       nextTarget = state.visibleIndices[nextPos];
     }
 
-    // Re-apply filter strictly in case previous active item was temporarily kept visible
-    if (state.filter !== "all" && currentIdx >= 0 && !itemMatchesFilter(state.items[currentIdx], state.filter)) {
+    if (
+      state.filter !== "all" &&
+      currentIdx >= 0 &&
+      !itemMatchesFilter(state.items[currentIdx], state.filter)
+    ) {
       applyFilterAndSelection(nextTarget, false);
     } else {
       selectItem(nextTarget, !state.lightbox.open);
@@ -1034,13 +1576,14 @@ function initApp() {
 
   function syncActionDock() {
     const item = state.activeIndex >= 0 ? state.items[state.activeIndex] : null;
+    const batchType = state.batch?.batch_type || "artwork";
     const locked = Boolean(state.batch?.review_done);
     const posInVisible = item ? state.visibleIndices.indexOf(state.activeIndex) : -1;
 
     if (!item) {
       el.dockIndexLabel.textContent = `0 / ${state.visibleIndices.length}`;
       el.dockItemLabel.textContent = "暂无选中图片";
-      el.dockBucketBadge.className = "bucket-badge bucket-discarded";
+      el.dockBucketBadge.className = "bucket-badge disp-discard";
       el.dockBucketBadge.textContent = "不收录";
       el.dockPrev.disabled = true;
       el.dockNext.disabled = true;
@@ -1049,8 +1592,9 @@ function initApp() {
       el.dockIndexLabel.textContent = `${posInVisible + 1} / ${state.visibleIndices.length}`;
       el.dockItemLabel.textContent =
         item.round > 1 ? `${item.filename} (R${item.round})` : item.filename;
-      el.dockBucketBadge.className = `bucket-badge bucket-${item.bucket}`;
-      el.dockBucketBadge.textContent = formatBucketLabel(item.bucket, item.tier);
+      const dispCls = getDispositionBadgeClass(item.destination, item.redraw);
+      el.dockBucketBadge.className = `bucket-badge ${dispCls}`;
+      el.dockBucketBadge.textContent = formatDispositionBadge(item.tier, item.flags, batchType);
       el.dockPrev.disabled = posInVisible <= 0;
       el.dockNext.disabled = posInVisible < 0 || posInVisible >= state.visibleIndices.length - 1;
       el.dockOpenLightbox.disabled = false;
@@ -1060,12 +1604,12 @@ function initApp() {
     el.dockNoteDot.hidden = !hasNote;
     el.lbNoteDot.hidden = !hasNote;
 
-    // Sync selected state across BOTH main action dock AND lightbox footer buttons
+    // Sync selected state across BOTH main action dock AND lightbox footer buttons (preserving tier === 0!)
     const allTierBtns = document.querySelectorAll("[data-action-tier]");
     for (const btn of allTierBtns) {
-      const t = Number(btn.getAttribute("data-action-tier"));
+      const t = parseTierStrict(btn.getAttribute("data-action-tier"));
       btn.disabled = !item || locked;
-      btn.classList.toggle("is-selected", Boolean(item && item.tier === t));
+      btn.classList.toggle("is-selected", Boolean(item && t !== null && item.tier === t));
     }
 
     const allFlagBtns = document.querySelectorAll("[data-action-flag]");
@@ -1083,7 +1627,7 @@ function initApp() {
   }
 
   /* ------------------------------------------------------------------------
-   * Verdict Mutations (1/2/3 Tiers, H/F/O/R Flags, N Note) + Optimistic Sync
+   * Verdict Mutations (Keys 1/2/3/4 -> Tiers 3/2/1/0, H/F/O/R Flags, N Note)
    * ---------------------------------------------------------------------- */
 
   function guardBatchEditable() {
@@ -1095,15 +1639,22 @@ function initApp() {
     return true;
   }
 
-  function toggleTierOnActive(tierValue) {
-    if (state.activeIndex < 0 || !guardBatchEditable()) return;
-    const item = state.items[state.activeIndex];
+  function toggleTierOnIndex(index, tierValue) {
+    if (index < 0 || index >= state.items.length || !isValidTier(tierValue) || !guardBatchEditable()) {
+      return;
+    }
+    const item = state.items[index];
     const nextTier = item.tier === tierValue ? null : tierValue;
-    applyItemMutation(state.activeIndex, {
+    applyItemMutation(index, {
       tier: nextTier,
       flags: item.flags,
       note: item.note,
     });
+  }
+
+  function toggleTierOnActive(tierValue) {
+    if (state.activeIndex < 0) return;
+    toggleTierOnIndex(state.activeIndex, tierValue);
   }
 
   function toggleFlagOnActive(flagCode) {
@@ -1124,15 +1675,16 @@ function initApp() {
     const item = state.items[index];
     if (!item || !state.batch) return;
 
-    item.tier = nextFields.tier;
+    item.tier = isValidTier(nextFields.tier) ? nextFields.tier : null;
     item.flags = normalizeFlags(nextFields.flags);
     item.note = typeof nextFields.note === "string" ? nextFields.note : "";
-    item.bucket = computeBucket(item.tier, item.flags);
+    const disp = computeDisposition(item.tier, item.flags);
+    item.destination = disp.destination;
+    item.redraw = disp.redraw;
     item.judged_at = isItemJudged(item) ? new Date().toISOString() : null;
 
     recomputeLocalBatchStats();
 
-    // Update UI immediately with zero image flicker
     patchCardVerdictDom(cardDomByIndex.get(index), item);
     renderBatchHeaderAndBanners();
     if (state.filter !== "all") {
@@ -1156,8 +1708,9 @@ function initApp() {
     const seq = (itemMutationSeq.get(key) || 0) + 1;
     itemMutationSeq.set(key, seq);
 
+    // Explicitly preserve tier = 0 (never coerce 0 to null!)
     const payload = {
-      tier: item.tier,
+      tier: isValidTier(item.tier) ? item.tier : null,
       flags: [...item.flags],
       note: item.note,
     };
@@ -1166,7 +1719,6 @@ function initApp() {
     const nextPromise = prevChain
       .catch(() => {})
       .then(async () => {
-        // If a newer keypress already arrived on this same item while waiting, skip redundant intermediate PATCH
         if (itemMutationSeq.get(key) !== seq) return;
 
         const url = `/api/review/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(
@@ -1198,7 +1750,6 @@ function initApp() {
           return;
         }
 
-        // Only apply server reconciliation if no newer keypress occurred during flight
         if (itemMutationSeq.get(key) === seq && data) {
           if (data.item) {
             const synced = normalizeItem(data.item, batchId);
@@ -1237,7 +1788,7 @@ function initApp() {
   }
 
   /* ------------------------------------------------------------------------
-   * 「审完本批」 & 「撤回审完状态」 (Rule 5)
+   * 「审完本批」 & 「撤回审完状态」
    * ---------------------------------------------------------------------- */
 
   async function setBatchReviewDone(reviewDone) {
@@ -1314,7 +1865,6 @@ function initApp() {
     state.lightbox.dragging = false;
     el.lightbox.hidden = true;
     document.body.style.overflow = "";
-    // Keep active card visible in grid/masonry upon closing lightbox
     if (state.activeIndex >= 0) {
       const card = cardDomByIndex.get(state.activeIndex);
       if (card) card.scrollIntoView({ block: "nearest" });
@@ -1343,6 +1893,7 @@ function initApp() {
   function renderLightboxOverlayOnly() {
     const item = state.items[state.activeIndex];
     if (!item) return;
+    const batchType = state.batch?.batch_type || "artwork";
 
     const pos = state.visibleIndices.indexOf(state.activeIndex);
     el.lbCounter.textContent = `${pos + 1} / ${state.visibleIndices.length}`;
@@ -1354,12 +1905,22 @@ function initApp() {
       el.lbRoundBadge.hidden = true;
     }
 
+    if (item.parent_item_id) {
+      el.lbLineageBadge.hidden = false;
+      el.lbLineageBadge.title = `源自 ${item.parent_item_id}`;
+      el.lbLineageBadge.textContent = `源自 ${item.parent_item_id}`;
+    } else {
+      el.lbLineageBadge.hidden = true;
+      el.lbLineageBadge.textContent = "";
+    }
+
     el.lbItemId.textContent = item.filename || item.item_id;
     el.lbDimensions.textContent =
       item.width && item.height ? `${item.width}×${item.height}` : "";
 
-    el.lbBucketBadge.className = `bucket-badge bucket-${item.bucket}`;
-    el.lbBucketBadge.textContent = formatBucketLabel(item.bucket, item.tier);
+    const dispCls = getDispositionBadgeClass(item.destination, item.redraw);
+    el.lbBucketBadge.className = `bucket-badge ${dispCls}`;
+    el.lbBucketBadge.textContent = formatDispositionBadge(item.tier, item.flags, batchType);
 
     renderBadgesInto(el.lbBadgesList, item);
 
@@ -1611,7 +2172,6 @@ function initApp() {
     el.btnViewGrid.addEventListener("click", () => setViewMode("grid"));
     el.btnViewMasonry.addEventListener("click", () => setViewMode("masonry"));
 
-    // ResizeObserver for zero-flicker Masonry spans
     if (typeof ResizeObserver !== "undefined") {
       const ro = new ResizeObserver(() => {
         if (state.route === "batch" && state.viewMode === "masonry") {
@@ -1645,11 +2205,14 @@ function initApp() {
     el.btnRevokeDone.addEventListener("click", () => setBatchReviewDone(false));
     el.btnBannerRevoke.addEventListener("click", () => setBatchReviewDone(false));
 
-    // Action Dock & Lightbox Footer Verdict Buttons
+    // Action Dock & Lightbox Footer Verdict Buttons (strictly preserving tier = 0!)
     document.addEventListener("click", (e) => {
       const tierBtn = e.target.closest("[data-action-tier]");
       if (tierBtn && !tierBtn.disabled) {
-        toggleTierOnActive(Number(tierBtn.getAttribute("data-action-tier")));
+        const tierVal = parseTierStrict(tierBtn.getAttribute("data-action-tier"));
+        if (tierVal !== null) {
+          toggleTierOnActive(tierVal);
+        }
         return;
       }
       const flagBtn = e.target.closest("[data-action-flag]");
@@ -1778,14 +2341,12 @@ function initApp() {
         const dx = e.clientX - lb.swipeStartX;
         const dy = e.clientY - lb.swipeStartY;
 
-        // Horizontal swipe navigation when at 1x Fit
         if (!lb.wasMultiTouch && lb.scale <= 1.02 && Math.abs(dx) > 56 && Math.abs(dx) > Math.abs(dy) * 1.4) {
           if (dx < 0) navigateRelative(1);
           else navigateRelative(-1);
           return;
         }
 
-        // Touch double-tap to toggle 1:1 / 2x zoom vs Fit
         if (e.pointerType === "touch" && !lb.wasMultiTouch && Math.hypot(dx, dy) < 14) {
           const now = Date.now();
           if (now - lb.lastTapTime < 300 && Math.hypot(e.clientX - lb.lastTapX, e.clientY - lb.lastTapY) < 32) {
@@ -1879,7 +2440,6 @@ function initApp() {
         return;
       }
 
-      // Suppress all review shortcuts while Note editor or any input/textarea has focus
       if (state.noteModalOpen || isEditableTarget(e.target)) {
         if (state.noteModalOpen && e.key === "Escape") {
           e.preventDefault();
@@ -1888,9 +2448,7 @@ function initApp() {
         return;
       }
 
-      // Never hijack browser modifier combinations (Cmd+R, Ctrl+1, etc.)
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-
       if (state.route !== "batch") return;
 
       const key = e.key;
@@ -1930,7 +2488,7 @@ function initApp() {
         return;
       }
 
-      // Lightbox zoom shortcuts
+      // Lightbox zoom shortcuts ("0" stays Fit-to-screen, zero conflict with 1/2/3/4!)
       if (state.lightbox.open) {
         if (key === "0") {
           e.preventDefault();
@@ -1949,14 +2507,14 @@ function initApp() {
         }
       }
 
-      // Tier keys: 1, 2, 3 (pressing same key toggles back to null)
-      if (key === "1" || key === "2" || key === "3") {
+      // 4-Star Tier Keys: 1 -> tier=3, 2 -> tier=2, 3 -> tier=1, 4 -> tier=0 (same key toggles back to null)
+      if (Object.prototype.hasOwnProperty.call(KEY_TO_TIER, key)) {
         e.preventDefault();
-        toggleTierOnActive(Number(key));
+        toggleTierOnActive(KEY_TO_TIER[key]);
         return;
       }
 
-      // Flag keys: H, F, O, R (stackable & independent of tier)
+      // Flag keys: H, F, O, R (stackable & orthogonal to tier)
       const upper = key.toUpperCase();
       if (upper === "H" || upper === "F" || upper === "O" || upper === "R") {
         e.preventDefault();

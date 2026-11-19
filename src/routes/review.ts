@@ -2,6 +2,7 @@ import { isItemJudged, isValidTier, normalizeFlags, parseFlagsJson } from "../bu
 import type { BatchRow, Env, FlagCode, TierValue, VerdictRow } from "../types.js";
 import {
   buildBatchSummary,
+  buildChannelsSummary,
   buildPreviewR2Key,
   buildReviewItemView,
   isSafeId,
@@ -25,18 +26,16 @@ function decodeSegments(pathname: string): string[] | null {
   return decoded;
 }
 
-async function handleListBatches(env: Env): Promise<Response> {
+async function handleListBatches(url: URL, env: Env): Promise<Response> {
   const { results: batches } = await env.DB.prepare(
     "SELECT * FROM batches ORDER BY created_at DESC, batch_id DESC"
   ).all<BatchRow>();
 
   if (batches.length === 0) {
-    return jsonResponse({ batches: [] });
+    return jsonResponse({ batches: [], channels: [] });
   }
 
-  const { results: allVerdicts } = await env.DB.prepare(
-    "SELECT * FROM verdicts"
-  ).all<VerdictRow>();
+  const { results: allVerdicts } = await env.DB.prepare("SELECT * FROM verdicts").all<VerdictRow>();
 
   const verdictsByBatch = new Map<string, VerdictRow[]>();
   for (const row of allVerdicts) {
@@ -48,11 +47,29 @@ async function handleListBatches(env: Env): Promise<Response> {
     }
   }
 
-  const summaries = batches.map((batch) =>
+  const allSummaries = batches.map((batch) =>
     buildBatchSummary(batch, verdictsByBatch.get(batch.batch_id) ?? [])
   );
 
-  return jsonResponse({ batches: summaries });
+  const channels = buildChannelsSummary(allSummaries);
+
+  let filteredBatches = allSummaries;
+  const channelParam = url.searchParams.get("channel");
+  if (channelParam !== null && channelParam.trim() !== "") {
+    const wantedChannel = channelParam.trim();
+    filteredBatches = filteredBatches.filter((b) => b.channel_id === wantedChannel);
+  }
+
+  const sourceParam = url.searchParams.get("source");
+  if (sourceParam !== null && sourceParam.trim() !== "") {
+    const wantedSource = sourceParam.trim();
+    filteredBatches = filteredBatches.filter((b) => b.source === wantedSource);
+  }
+
+  return jsonResponse({
+    batches: filteredBatches,
+    channels,
+  });
 }
 
 async function handleGetBatchDetail(env: Env, batchId: string): Promise<Response> {
@@ -173,12 +190,13 @@ async function handlePatchItem(
 
   const patch = body as Record<string, unknown>;
 
-  let nextTier: TierValue = normalizeTierFromDb(
-    existingRow.tier === null ? null : Number(existingRow.tier)
-  );
+  let nextTier: TierValue = normalizeTierFromDb(existingRow.tier);
   if ("tier" in patch && patch.tier !== undefined) {
     if (!isValidTier(patch.tier)) {
-      return jsonResponse({ error: "invalid_tier", message: "tier must be 1, 2, 3, or null" }, 400);
+      return jsonResponse(
+        { error: "invalid_tier", message: "tier must be 0, 1, 2, 3, or null" },
+        400
+      );
     }
     nextTier = patch.tier;
   }
@@ -282,13 +300,18 @@ async function handleSetReviewDone(
   }
 
   const nextFlag = reviewDone ? 1 : 0;
-  await env.DB.prepare("UPDATE batches SET review_done = ? WHERE batch_id = ?")
-    .bind(nextFlag, batchId)
+  const nextDoneAt = reviewDone ? new Date().toISOString() : null;
+
+  await env.DB.prepare(
+    "UPDATE batches SET review_done = ?, review_done_at = ? WHERE batch_id = ?"
+  )
+    .bind(nextFlag, nextDoneAt, batchId)
     .run();
 
   const updatedBatch: BatchRow = {
     ...batch,
     review_done: nextFlag,
+    review_done_at: nextDoneAt,
   };
 
   const { results: verdictRows } = await env.DB.prepare(
@@ -301,7 +324,11 @@ async function handleSetReviewDone(
   return jsonResponse({ batch: batchSummary });
 }
 
-export async function handleReviewRequest(request: Request, url: URL, env: Env): Promise<Response> {
+export async function handleReviewRequest(
+  request: Request,
+  url: URL,
+  env: Env
+): Promise<Response> {
   const segments = decodeSegments(url.pathname);
   if (!segments) {
     return jsonResponse({ error: "invalid_path" }, 400);
@@ -312,7 +339,7 @@ export async function handleReviewRequest(request: Request, url: URL, env: Env):
     if (request.method !== "GET") {
       return jsonResponse({ error: "method_not_allowed" }, 405);
     }
-    return handleListBatches(env);
+    return handleListBatches(url, env);
   }
 
   // GET /api/review/batches/:batchId

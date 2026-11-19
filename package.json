@@ -6,7 +6,7 @@
   "description": "Ephemeral AI image review outpost on Cloudflare Workers, R2, D1, and Access",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "deploy": "CI=true wrangler d1 migrations apply DB --remote && wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "vitest run tests/worker"
   },

@@ -1,14 +1,22 @@
 export type FlagCode = "H" | "F" | "O" | "R";
-export type TierValue = 1 | 2 | 3 | null;
-export type BucketName = "archived" | "repair" | "redraw" | "discarded";
+export type TierValue = 3 | 2 | 1 | 0 | null;
+export type DestinationName = "archive" | "repair" | "discard";
+export type BatchType = "artwork" | "face" | "outfit";
 
-export interface BucketCounts {
-  pushed: number;
-  archived: number;
-  repair: number;
-  redraw: number;
-  discarded: number;
+export interface ItemDisposition {
+  destination: DestinationName;
+  redraw: boolean;
 }
+
+export interface DispositionCounts {
+  pushed: number;
+  archive: number;
+  repair: number;
+  discard: number;
+  redraw: number;
+}
+
+export type BucketCounts = DispositionCounts;
 
 export interface D1Result<T = Record<string, unknown>> {
   results: T[];
@@ -115,8 +123,12 @@ export interface Env {
 export interface BatchRow {
   batch_id: string;
   agent_id: string;
+  source: string;
+  line: string | null;
+  batch_type: string;
   pushed_count: number;
   review_done: number;
+  review_done_at: string | null;
   created_at: string;
   previews_purged_at: string | null;
 }
@@ -128,6 +140,7 @@ export interface VerdictRow {
   filename: string | null;
   width: number | null;
   height: number | null;
+  parent_item_id: string | null;
   pushed_at: string;
   tier: number | null;
   flags_json: string;
@@ -141,23 +154,53 @@ export interface PushManifestItem {
   filename?: string | null;
   width?: number | null;
   height?: number | null;
+  parent_item_id?: string | null;
 }
 
 export interface PushManifest {
   agent_id: string;
   batch_id: string;
+  source?: string | null;
+  line?: string | null;
+  batch_type?: string | null;
   items: PushManifestItem[];
+}
+
+export interface ChannelSummary {
+  channel_id: string;
+  source: string;
+  line: string | null;
+  total_batches: number;
+  pending_batches: number;
 }
 
 export interface BatchSummary {
   batch_id: string;
   agent_id: string;
+  source: string;
+  line: string | null;
+  channel_id: string;
+  batch_type: BatchType;
   pushed_count: number;
   judged_count: number;
   review_done: boolean;
+  review_done_at: string | null;
   created_at: string;
   previews_purged_at: string | null;
-  counts: BucketCounts;
+  counts: DispositionCounts;
+}
+
+export interface AgentBatchSummary {
+  batch_id: string;
+  agent_id: string;
+  source: string;
+  line: string | null;
+  channel_id: string;
+  batch_type: BatchType;
+  pushed_count: number;
+  review_done: boolean;
+  review_done_at: string | null;
+  created_at: string;
 }
 
 export interface ReviewItemView {
@@ -167,11 +210,13 @@ export interface ReviewItemView {
   filename: string | null;
   width: number | null;
   height: number | null;
+  parent_item_id: string | null;
   pushed_at: string;
   tier: TierValue;
   flags: FlagCode[];
   note: string;
   judged_at: string | null;
-  bucket: BucketName;
+  destination: DestinationName;
+  redraw: boolean;
   preview_url: string;
 }

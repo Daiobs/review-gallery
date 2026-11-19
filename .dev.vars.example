@@ -1,9 +1,15 @@
-# Production Secrets (prompted by "Deploy to Cloudflare"; for local dev, copy to .dev.vars)
+# Production Worker Secrets (prompted by "Deploy to Cloudflare"; for local dev, copy to .dev.vars)
 CF_ACCESS_TEAM_DOMAIN=<YOUR_TEAM>.cloudflareaccess.com
 CF_ACCESS_AUD=<CF_ACCESS_APPLICATION_AUD_TAG>
 CF_ACCESS_ALLOWED_EMAILS=<YOUR_EMAIL>
 AGENT_TOKENS_JSON={"muse-main":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>","argon-mac":"<GENERATE_WITH_OPENSSL_RAND_HEX_32>"}
 
-# Local-only overrides (uncomment ONLY in local .dev.vars when testing without Access JWT):
+# Local-only Worker overrides (uncomment ONLY in local .dev.vars when testing UI without Access JWT;
+# takes effect ONLY when BOTH ENVIRONMENT=development AND DEV_BYPASS_ACCESS=true):
 # ENVIRONMENT=development
 # DEV_BYPASS_ACCESS=true
+
+# Agent CLI client-side optional env vars (set on the Agent machine, NOT as Worker secrets;
+# used by agent/hub_client.py when calling *.workers.dev protected by Cloudflare Access Service Auth):
+# CF_ACCESS_CLIENT_ID=<CF_ACCESS_SERVICE_TOKEN_CLIENT_ID>
+# CF_ACCESS_CLIENT_SECRET=<CF_ACCESS_SERVICE_TOKEN_CLIENT_SECRET>
