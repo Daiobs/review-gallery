@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "transport": "rclone",
+  "rclone_remote": "gdrive:",
+  "rclone_bin": "rclone",
+  "parallel_transfers": 4,
+  "ledger_backup_path": "AI_Archive/ledger-{agent_id}.jsonl",
+  "repair_staging_dir": "aigc/待修复-修手修脚",
+  "routes": {
+    "artwork": {
+      "tiers": {
+        "3": "aigc/成图收录/神图",
+        "2": "aigc/成图收录/心动",
+        "1": "aigc/成图收录/高品质",
+        "0": "aigc/成图收录/收藏"
+      },
+      "write_combo_card": true,
+      "combo_card_ext": ".md"
+    },
+    "face": {
+      "tiers": {
+        "3": "aigc/脸模库/三星-核心锚",
+        "2": "aigc/脸模库/二星-优质锚",
+        "1": "aigc/脸模库/一星-达标锚",
+        "0": "aigc/脸模库/留样"
+      },
+      "write_combo_card": false
+    },
+    "outfit": {
+      "tiers": {
+        "3": "aigc/服装库/三星-核心锚",
+        "2": "aigc/服装库/二星-优质锚",
+        "1": "aigc/服装库/一星-达标锚",
+        "0": "aigc/服装库/留样"
+      },
+      "write_combo_card": false
+    }
+  }
+}
